@@ -1,0 +1,30 @@
+# Distribution archives
+*.zip
+*.tar.gz
+
+# Environment & credentials
+.env
+.env.*
+*.pem
+
+# Internal process & store publishing documents
+BETA_*.md
+CHROMEWEBSTORE.md
+store-assets/
+generate_icons.py
+
+# Python artifacts
+__pycache__/
+*.pyc
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Node / dependencies (if any are added)
+node_modules/
+npm-debug.log*

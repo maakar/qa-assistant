@@ -1,0 +1,41 @@
+{
+  "version": 2,
+  "entries": [
+    {
+      "tagName": "BUTTON",
+      "textSnippet": "Login",
+      "selector": "page.getByRole('button', { name: 'Login' })",
+      "type": "Playwright"
+    },
+    {
+      "tagName": "INPUT",
+      "textSnippet": "Email",
+      "selector": "page.getByPlaceholder('Email')",
+      "type": "Playwright"
+    },
+    {
+      "tagName": "DIV",
+      "textSnippet": "Success message",
+      "selector": "//div[@id='status-message']//span[contains(text(), 'Success')]",
+      "type": "XPath"
+    },
+    {
+      "tagName": "LI",
+      "textSnippet": "Dashboard Link",
+      "selector": "#main-nav #item-dashboard",
+      "type": "CSS"
+    },
+    {
+      "tagName": "A",
+      "textSnippet": "Profile",
+      "selector": "page.locator('#top-header').getByRole('link', { name: 'Profile' })",
+      "type": "Playwright"
+    },
+    {
+      "tagName": "SPAN",
+      "textSnippet": "User Name",
+      "selector": "//div[@id='user-profile']//span[@class='name']",
+      "type": "XPath"
+    }
+  ]
+}

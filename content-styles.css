@@ -1,0 +1,129 @@
+/* Interactive Hover Overlay */
+#qa-hover-overlay {
+  position: fixed;
+  pointer-events: none;
+  z-index: 2147483647;
+  border: 2px dashed #6366f1;
+  background-color: rgba(99, 102, 241, 0.05);
+  transition: all 0.05s ease;
+  display: none;
+  border-radius: 2px;
+  box-sizing: border-box;
+}
+
+/* Validation / Verification Overlays (Green Theme) */
+.qa-verify-overlay {
+  position: fixed;
+  pointer-events: none;
+  z-index: 2147483645;
+  border: 2px solid #10b981;
+  background-color: rgba(16, 185, 129, 0.1);
+  border-radius: 2px;
+  box-sizing: border-box;
+  transition: all 0.2s ease;
+}
+
+.qa-verify-badge {
+  position: absolute;
+  top: -20px;
+  right: 0;
+  background: #10b981;
+  color: white;
+  padding: 2px 6px;
+  font-size: 10px;
+  font-weight: bold;
+  border-radius: 4px;
+  font-family: sans-serif;
+  pointer-events: none;
+}
+
+/* Floating Result Overlay */
+.qa-assistant-overlay {
+  position: absolute;
+  z-index: 1000000;
+  background: white;
+  border: 1px solid #dadce0;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  padding: 16px;
+  width: 350px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  color: #3c4043;
+  font-size: 13px;
+  pointer-events: auto;
+}
+
+.qa-assistant-overlay header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #f1f3f4;
+}
+
+.qa-assistant-overlay h4 {
+  margin: 0;
+  font-size: 14px;
+  color: #4285f4;
+}
+
+.qa-assistant-overlay .close-btn {
+  background: none;
+  border: none;
+  font-size: 18px;
+  cursor: pointer;
+  color: #5f6368;
+}
+
+.qa-assistant-overlay .locator-row {
+  margin-bottom: 10px;
+}
+
+.qa-assistant-overlay .locator-label {
+  font-weight: 600;
+  font-size: 11px;
+  color: #70757a;
+  text-transform: uppercase;
+}
+
+.qa-assistant-overlay .locator-value {
+  background: #f8f9fa;
+  padding: 6px 8px;
+  border-radius: 4px;
+  border: 1px solid #e8eaed;
+  font-family: monospace;
+  word-break: break-all;
+  margin-top: 4px;
+}
+
+.qa-assistant-overlay .explanation {
+  font-size: 12px;
+  color: #5f6368;
+  font-style: italic;
+  margin-top: 8px;
+}
+
+/* Persistent Selection Overlay (Blue/Solid) */
+#qa-selection-overlay {
+  position: fixed; /* BUG-11 fix: use fixed like all other overlays; JS handles scroll offset when needed */
+  pointer-events: none;
+  z-index: 2147483646;
+  border: 3px solid #6366f1;
+  background-color: rgba(99, 102, 241, 0.1);
+  display: none;
+  border-radius: 4px;
+  box-sizing: border-box;
+  box-shadow: 0 0 15px rgba(99, 102, 241, 0.3);
+}
+
+/* Highlight Helper Classes */
+.qa-assistant-highlight {
+  outline: 4px solid #6366f1 !important;
+  outline-offset: 2px !important;
+  transition: outline 0.2s ease-in-out;
+}
+
+.qa-assistant-hover {
+  outline: 2px dashed #6366f1 !important;
+}
