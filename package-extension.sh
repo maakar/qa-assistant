@@ -37,6 +37,7 @@ done
 # Create ZIP archive excluding developer, documentation, and asset files
 zip -r "$OUTPUT" . \
   -x ".git/*" \
+  -x ".gitignore" \
   -x "node_modules/*" \
   -x ".env" \
   -x "*.map" \
