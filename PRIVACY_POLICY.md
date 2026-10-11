@@ -83,4 +83,4 @@ If you have any questions or feedback regarding this Privacy Policy, please cont
 
 **QAMethod Support**  
 Email: [support@qamethod.com](mailto:support@qamethod.com)  
-Website: [https://github.com/qamethod/qa-assistant](https://github.com/qamethod/qa-assistant)
+Website: [https://github.com/maakar/qa-assistant](https://github.com/maakar/qa-assistant)
