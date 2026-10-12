@@ -11,6 +11,7 @@
 BETA_*.md
 CHROMEWEBSTORE.md
 store-assets/
+imgs/
 generate_icons.py
 
 # Python artifacts

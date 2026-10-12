@@ -45,6 +45,7 @@ zip -r "$OUTPUT" . \
   -x "*.sh" \
   -x "*.py" \
   -x "store-assets/*" \
+  -x "imgs/*" \
   -x "*.zip" \
   -x ".DS_Store" \
   -x "Thumbs.db"
