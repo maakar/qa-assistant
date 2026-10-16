@@ -4,6 +4,8 @@ let currentTabId = null;
 let currentSiteUrl = "";
 let sessionHistory = []; // Array of session objects
 let currentSession = null;
+let ownedSessionId = null; // Only this panel may write the active request's results.
+let restoreGeneration = 0;
 let isHealing = false; // Global lock for AI refinement operations
 
 const ICON_DELETE = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6M8 6V4c0-1 1-2 2-2h4c1 0 1 1 2 2v2"/></svg>';
@@ -37,6 +39,12 @@ function isEqualTarget(a, b) {
     }, {});
   };
   return JSON.stringify(sortKeys(a)) === JSON.stringify(sortKeys(b));
+}
+
+function findActiveSessionIndex(history, active) {
+  return history.findIndex(session => active.sessionId
+    ? session.id === active.sessionId
+    : isEqualTarget(session.target, active.targetData));
 }
 
 function splitCodeBlockIntoExpressions(code) {
@@ -257,6 +265,10 @@ function init() {
           setInspectionUIState(false);
         }
 
+        restoreGeneration++;
+        ownedSessionId = null;
+        currentSession = null;
+        sessionHistory = [];
         currentTabId = tabId;
         chrome.tabs.get(tabId, (tab) => {
           if (chrome.runtime.lastError || !tab) return;
@@ -278,6 +290,9 @@ function init() {
         const hostChanged = newHost !== currentSiteUrl;
         updateTabInfo(tab);
         if (hostChanged) {
+          restoreGeneration++;
+          ownedSessionId = null;
+          currentSession = null;
           sessionHistory = [];
           syncWithBackground(tabId);
         }
@@ -365,14 +380,20 @@ function saveToKnowledgeBase(data) {
 
 async function syncWithBackground(tabId) {
   chrome.runtime.sendMessage({ action: 'GET_ACTIVE_SESSION', tabId: tabId }, (active) => {
+    if (chrome.runtime.lastError || tabId !== currentTabId) return;
     if (active) {
+      if (active.sessionId && active.sessionId === ownedSessionId && currentSession?.id === active.sessionId &&
+          active.isStreaming) return; // Do not replace a live session with a stale restore.
       if (active.isInspecting) setInspectionUIState(true);
       if (active.isStreaming || active.accumulatedText) {
+        ownedSessionId = active.isStreaming ? (active.sessionId || null) : null;
         restoreState(tabId, active);
       } else {
+        ownedSessionId = null;
         restoreState(tabId);
       }
     } else {
+      ownedSessionId = null;
       restoreState(tabId);
     }
   });
@@ -414,6 +435,7 @@ function getSiteStorageKey() {
 
 async function restoreState(tabId, activeSessionBuffer = null) {
   const key = getSiteStorageKey();
+  const generation = ++restoreGeneration;
   const legacyKey = `state_${tabId}`;
 
   chrome.runtime.sendMessage({
@@ -422,7 +444,9 @@ async function restoreState(tabId, activeSessionBuffer = null) {
     legacyKey,
     siteHost: currentSiteUrl
   }, async (stored) => {
-    if (chrome.runtime.lastError) return;
+    if (chrome.runtime.lastError || generation !== restoreGeneration ||
+        tabId !== currentTabId || key !== getSiteStorageKey() ||
+        (ownedSessionId && activeSessionBuffer?.sessionId !== ownedSessionId)) return;
     sessionHistory = (stored && stored.history) || [];
     const container = document.getElementById('results-container');
     if (!container) return;
@@ -431,16 +455,19 @@ async function restoreState(tabId, activeSessionBuffer = null) {
     
     // Handle active buffer from background
     let matchedSession = null;
-    if (activeSessionBuffer && activeSessionBuffer.targetData) {
-      const matchedIndex = sessionHistory.findIndex(s =>
-        isEqualTarget(s.target, activeSessionBuffer.targetData)
-      );
+    let persistRecoveredCompletion = false;
+    if (activeSessionBuffer && activeSessionBuffer.targetData &&
+        !(activeSessionBuffer.sessionId && stored?.deletedIds?.includes(activeSessionBuffer.sessionId))) {
+      const matchedIndex = findActiveSessionIndex(sessionHistory, activeSessionBuffer);
       
       if (matchedIndex === -1) {
         if (activeSessionBuffer.isStreaming || activeSessionBuffer.accumulatedText) {
           const providerLabel = await getActiveProviderLabel();
+          if (generation !== restoreGeneration || tabId !== currentTabId ||
+              key !== getSiteStorageKey() ||
+              (ownedSessionId && activeSessionBuffer.sessionId !== ownedSessionId)) return;
           currentSession = { 
-            id: generateSessionId(),
+            id: activeSessionBuffer.sessionId || generateSessionId(),
             target: activeSessionBuffer.targetData, 
             text: activeSessionBuffer.accumulatedText || "", 
             isFinished: !activeSessionBuffer.isStreaming,
@@ -448,6 +475,7 @@ async function restoreState(tabId, activeSessionBuffer = null) {
           };
           sessionHistory.unshift(currentSession);
           matchedSession = currentSession;
+          persistRecoveredCompletion = currentSession.isFinished && !!currentSession.text;
         }
       } else {
         currentSession = sessionHistory[matchedIndex];
@@ -458,10 +486,12 @@ async function restoreState(tabId, activeSessionBuffer = null) {
         } else if (!currentSession.isFinished && activeSessionBuffer.accumulatedText) {
           currentSession.text = activeSessionBuffer.accumulatedText;
           currentSession.isFinished = true;
+          persistRecoveredCompletion = true;
         }
       }
     }
 
+    if (!matchedSession && sessionHistory.length === 0) currentSession = null;
     if (sessionHistory.length === 0) {
       container.innerHTML = '<div class="empty-state" style="text-align: center; opacity: 0.5; margin-top: 40px;"><p>Select an element to target.</p></div>';
       return;
@@ -503,22 +533,22 @@ async function restoreState(tabId, activeSessionBuffer = null) {
     
     const masterOut = document.getElementById('full-response-wrapper');
     if (masterOut) masterOut.style.display = 'block';
+    if (persistRecoveredCompletion && matchedSession) saveState(matchedSession);
   });
 }
 
-function saveState() {
+function saveState(session = currentSession) {
+  if (!session || !sessionHistory.some(s => s.id === session.id)) return;
   const key = getSiteStorageKey();
-  const history = sessionHistory.map(session => {
-    if (!session.id) session.id = generateSessionId();
-    return {
-      id: session.id,
-      target: session.target,
-      text: session.text,
-      isFinished: session.isFinished,
-      title: session.title || "",
-      providerLabel: session.providerLabel || ""
-    };
-  });
+  if (!session.id) session.id = generateSessionId();
+  const history = [{
+    id: session.id,
+    target: session.target,
+    text: session.text,
+    isFinished: session.isFinished,
+    title: session.title || "",
+    providerLabel: session.providerLabel || ""
+  }];
   chrome.runtime.sendMessage({
     action: 'UPSERT_SITE_SESSIONS',
     key,
@@ -596,7 +626,7 @@ function createSessionBlock(session, index) {
       const nextTitle = commit ? input.value : (session.title || getDefaultSessionTitle(targetInfo));
       input.replaceWith(titleEl);
       setSessionTitle(session, block, nextTitle);
-      if (commit) saveState();
+      if (commit) saveState(session);
     };
 
     input.addEventListener('click', evt => evt.stopPropagation());
@@ -613,7 +643,7 @@ function createSessionBlock(session, index) {
 
   deleteBtn.addEventListener('click', (e) => {
     e.stopPropagation(); // Prevent toggling the session when deleting
-    const historyIndex = sessionHistory.findIndex(s => s.target === targetInfo);
+    const historyIndex = sessionHistory.findIndex(s => s.id === session.id);
     if (historyIndex !== -1) {
       const [deletedSession] = sessionHistory.splice(historyIndex, 1);
       block.remove();
@@ -623,6 +653,7 @@ function createSessionBlock(session, index) {
           key: getSiteStorageKey(),
           sessionId: deletedSession.id
         });
+        if (ownedSessionId === deletedSession.id) ownedSessionId = null;
       }
       
       // If no sessions left, we might want to show a message or clear the master output
@@ -778,10 +809,15 @@ document.getElementById('start-inspect')?.addEventListener('click', async () => 
 // Runtime Message Handling
 chrome.runtime.onMessage.addListener((message) => {
   if (message.action === 'ANALYSIS_START') {
-    if (currentTabId && message.tabId && message.tabId !== currentTabId) return;
+    if (!currentTabId || message.tabId !== currentTabId) return;
     
     const data = safeJsonParse(message.data);
-    if (!data) return;
+    if (!data || !message.sessionId) return;
+    // Invalidate a pending initial restore before its callback can replace this request.
+    restoreGeneration++;
+    const requestTabId = message.tabId;
+    const requestKey = getSiteStorageKey();
+    ownedSessionId = message.sessionId;
     setInspectionUIState(false);
     
     // Clear highlights on new selection
@@ -793,24 +829,39 @@ chrome.runtime.onMessage.addListener((message) => {
     const container = document.getElementById('results-container');
     const emptyState = container.querySelector('.empty-state');
     if (emptyState) emptyState.remove();
-    
-    // Get provider label asynchronously before creating session
-    getActiveProviderLabel().then((providerLabel) => {
-      currentSession = { id: generateSessionId(), target: data, text: "", isFinished: false, providerLabel: providerLabel };
-      const block = createSessionBlock(currentSession, sessionHistory.length);
-      currentSession.block = block;
-      
-      container.prepend(block);
-      sessionHistory.unshift(currentSession);
-      saveState();
 
-      // Clear Master Output for new session
-      const rawOutput = document.getElementById('full-response-text');
-      if (rawOutput) rawOutput.textContent = "";
+    // Create the request immediately so early stream chunks cannot land on a previous session.
+    let session = sessionHistory.find(s => s.id === message.sessionId);
+    if (!session) {
+      session = { id: message.sessionId, target: data, text: "", isFinished: false, providerLabel: "" };
+      sessionHistory.unshift(session);
+    }
+    currentSession = session;
+    if (!session.block?.isConnected) {
+      const block = createSessionBlock(session, sessionHistory.length - 1);
+      session.block = block;
+      container.prepend(block);
+    }
+    saveState(session);
+
+    const rawOutput = document.getElementById('full-response-text');
+    if (rawOutput) rawOutput.textContent = "";
+    getActiveProviderLabel().then((providerLabel) => {
+      if (requestTabId !== currentTabId || requestKey !== getSiteStorageKey() ||
+          (ownedSessionId !== message.sessionId && currentSession !== session) ||
+          !sessionHistory.includes(session)) return;
+      session.providerLabel = providerLabel;
+      const badge = session.block?.querySelector('.session-provider-badge');
+      if (badge) {
+        badge.innerText = providerLabel;
+        badge.style.display = 'inline-block';
+      }
+      saveState(session);
     });
 
   } else if (message.action === 'AI_STREAM_CHUNK') {
-    if (currentTabId && message.tabId && message.tabId !== currentTabId) return;
+    if (!currentTabId || message.tabId !== currentTabId) return;
+    if (!ownedSessionId || !currentSession || currentSession.id !== ownedSessionId) return;
 
     if (currentSession) {
       const loader = document.getElementById('loader');
@@ -822,7 +873,8 @@ chrome.runtime.onMessage.addListener((message) => {
       if (chunk === "FinishedSuccessfullyMark") {
         currentSession.isFinished = true;
         parseAndRenderCards(currentSession.text, currentSession.block.querySelector('.session-content'));
-        saveState();
+        saveState(currentSession);
+        ownedSessionId = null;
         if (currentTabId) {
           chrome.runtime.sendMessage({ action: 'CLEAR_ACTIVE_SESSION', tabId: currentTabId });
         }
@@ -854,7 +906,7 @@ chrome.runtime.onMessage.addListener((message) => {
   } else if (message.action === 'AI_REFINEMENT_CHUNK') {
     handleRefinementChunk(message.data, message.locatorType);
   } else if (message.action === 'SITE_STATE_CHANGED') {
-    if (message.key === getSiteStorageKey() && !isHealing && (!currentSession || currentSession.isFinished)) {
+    if (message.key === getSiteStorageKey() && !isHealing && !ownedSessionId) {
       restoreState(currentTabId);
     }
   }
@@ -1321,6 +1373,9 @@ function updateHealButtonsState() {
 document.getElementById('clear-all-btn').addEventListener('click', () => {
   if (confirm('Clear history?')) {
     sessionHistory = [];
+    ownedSessionId = null;
+    currentSession = null;
+    restoreGeneration++;
     const key = getSiteStorageKey();
     chrome.runtime.sendMessage({
       action: 'CLEAR_SITE_STATE',

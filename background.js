@@ -242,8 +242,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return true;
     }
 
+    // One request ID is shared by the live buffer and every panel rendering it.
+    const sessionId = generateStoredSessionId();
     activeSessionsByTab[tabId] = {
       ...activeSessionsByTab[tabId],
+      sessionId,
       targetData,
       accumulatedText: "",
       isStreaming: true,
@@ -254,6 +257,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     chrome.runtime.sendMessage({
       action: 'ANALYSIS_START',
       data: message.data,
+      sessionId,
       tabId: tabId
     }).catch(() => {});
 
@@ -311,8 +315,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const session = { ...incoming, id: incoming.id || generateStoredSessionId() };
         if (deleted.has(session.id)) continue;
         const index = state.history.findIndex(existing => existing.id === session.id);
-        if (index >= 0) state.history[index] = session;
-        else state.history.unshift(session);
+        if (index >= 0) {
+          const existing = state.history[index];
+          // A delayed panel write must not roll a completed request back to empty.
+          if (existing.isFinished && !session.isFinished) {
+            state.history[index] = {
+              ...existing,
+              title: session.title || existing.title,
+              providerLabel: session.providerLabel || existing.providerLabel
+            };
+            continue;
+          }
+          state.history[index] = {
+            ...existing,
+            ...session,
+            text: session.text || existing.text,
+            title: session.title || existing.title,
+            providerLabel: session.providerLabel || existing.providerLabel
+          };
+        } else state.history.unshift(session);
       }
       state.url = message.siteHost;
     }).then(() => sendResponse({ ok: true }));
