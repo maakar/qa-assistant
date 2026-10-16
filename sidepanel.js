@@ -1595,7 +1595,7 @@ async function refreshEngineAvailability(options = {}) {
 
   if (nanoOpt) nanoOpt.hidden = !chromeAiAvailable;
   if (ollamaOpt) {
-    ollamaOpt.hidden = !ollamaAvailable;
+    ollamaOpt.hidden = false;
     ollamaOpt.innerText = 'Ollama';
   }
   if (ollamaNotice) {
