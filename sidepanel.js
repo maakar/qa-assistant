@@ -18,6 +18,23 @@ function safeJsonParse(value, fallback = null) {
   }
 }
 
+function isEqualTarget(a, b) {
+  if (!a || !b) return false;
+  if (a.tagName !== b.tagName) return false;
+  if ((a.id || '') !== (b.id || '')) return false;
+  if ((a.testId || '') !== (b.testId || '')) return false;
+  if ((a.textSnippet || '') !== (b.textSnippet || '')) return false;
+
+  const sortKeys = (obj) => {
+    if (!obj || typeof obj !== 'object') return obj;
+    return Object.keys(obj).sort().reduce((acc, k) => {
+      acc[k] = sortKeys(obj[k]);
+      return acc;
+    }, {});
+  };
+  return JSON.stringify(sortKeys(a)) === JSON.stringify(sortKeys(b));
+}
+
 function showPanelError(message) {
   const loader = document.getElementById('loader');
   const loaderText = document.getElementById('loader-text');
@@ -92,6 +109,32 @@ function initThemeSystem() {
     });
   }
 
+  // Side Panel Scope controls: applies immediately on change without needing a manual save button
+  const scopeSelect = document.getElementById('scope-select');
+  const scopeStatus = document.getElementById('scope-status');
+
+  chrome.storage.local.get(['sidePanelScope'], (res) => {
+    const scope = res.sidePanelScope || 'tab';
+    if (scopeSelect) scopeSelect.value = scope;
+  });
+
+  if (scopeSelect) {
+    scopeSelect.addEventListener('change', async (e) => {
+      const scope = e.target.value;
+      chrome.storage.local.set({ sidePanelScope: scope }, () => {
+        chrome.runtime.sendMessage({ action: 'UPDATE_PANEL_SCOPE', scope });
+      });
+
+      if (scopeStatus) {
+        scopeStatus.style.display = 'inline';
+        scopeStatus.innerText = scope === 'all' ? '✓ Applied: Follow All Tabs' : '✓ Applied: Current Tab Only';
+        setTimeout(() => { scopeStatus.style.display = 'none'; }, 2500);
+      }
+
+      // Mode updated without forcing window-level takeover so per-tab panels remain independent
+    });
+  }
+
   // Auto react to system color scheme changes if set to 'system'
   if (window.matchMedia) {
     window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
@@ -103,6 +146,13 @@ function initThemeSystem() {
     });
   }
 }
+
+window.addEventListener('beforeunload', () => {
+  if (currentTabId) {
+    chrome.tabs.sendMessage(currentTabId, { action: 'CLEAR_HIGHLIGHTS' }).catch(() => {});
+    chrome.tabs.sendMessage(currentTabId, { action: 'STOP_INSPECTION' }).catch(() => {});
+  }
+});
 
 // Initialize the side panel and tools
 function init() {
@@ -137,6 +187,44 @@ function init() {
   setupManualTool();
   setupFreezeTool();
   refreshMemoryUI();
+
+  // FEAT-P7: Tab switching listener
+  const isDetached = params.get('mode') === 'detached';
+  if (!isDetached && chrome.tabs?.onActivated) {
+    chrome.tabs.onActivated.addListener(async ({ tabId }) => {
+      const data = await chrome.storage.local.get(['sidePanelScope']);
+      const scope = data.sidePanelScope || 'tab';
+
+      if (scope === 'tab') {
+        // In "Current Tab Only" mode, keep the side panel tied to its origin tab (currentTabId)
+        // without closing or resetting the session when the user views another tab
+        return;
+      }
+
+      if (scope === 'all') {
+        if (currentTabId === tabId) return;
+
+        if (currentTabId) {
+          chrome.tabs.sendMessage(currentTabId, { action: 'STOP_INSPECTION' }).catch(() => {});
+          setInspectionUIState(false);
+        }
+
+        currentTabId = tabId;
+        chrome.tabs.get(tabId, (tab) => {
+          if (chrome.runtime.lastError || !tab) return;
+          updateTabInfo(tab);
+          syncWithBackground(tabId);
+        });
+      }
+    });
+
+    chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+      if (tabId !== currentTabId) return;
+      if (changeInfo.status === 'complete' || changeInfo.url) {
+        updateTabInfo(tab);
+      }
+    });
+  }
 }
 
 async function ensureContentScriptInjected(tabId) {
@@ -258,20 +346,19 @@ function updateTabInfo(tab) {
   }
 }
 
-async function restoreState(tabId, activeSessionBuffer = null) {
-  const key = `state_${tabId}`;
-  chrome.storage.local.get([key], async (result) => {
-    const stored = result[key];
+function getSiteStorageKey() {
+  const host = currentSiteUrl && currentSiteUrl !== 'Internal Page' ? currentSiteUrl : `tab_${currentTabId}`;
+  return `state_site_${host}`;
+}
 
-    // BUG-09: If the stored URL doesn't match the current URL, the tab ID was recycled.
-    // Clear the stale session rather than restore data from a different site.
-    if (stored && stored.url && currentSiteUrl && stored.url !== currentSiteUrl) {
-      console.warn(`[QA] Tab ${tabId} URL changed (${stored.url} → ${currentSiteUrl}). Clearing stale session.`);
-      chrome.storage.local.remove(key);
-      sessionHistory = [];
-    } else {
-      sessionHistory = (stored && stored.history) || [];
-    }
+async function restoreState(tabId, activeSessionBuffer = null) {
+  const key = getSiteStorageKey();
+  // Also check legacy state_${tabId} for smooth backwards compatibility
+  const legacyKey = `state_${tabId}`;
+
+  chrome.storage.local.get([key, legacyKey], async (result) => {
+    const stored = result[key] || result[legacyKey];
+    sessionHistory = (stored && stored.history) || [];
     const container = document.getElementById('results-container');
     if (!container) return;
     
@@ -279,24 +366,27 @@ async function restoreState(tabId, activeSessionBuffer = null) {
     
     // Handle active buffer from background
     if (activeSessionBuffer && activeSessionBuffer.targetData) {
-      // BUG-07 fix: search ALL history entries, not just [0], to prevent duplicate session creation
-      const isAlreadyInHistory = sessionHistory.some(s =>
-        JSON.stringify(s.target) === JSON.stringify(activeSessionBuffer.targetData)
+      const matchedIndex = sessionHistory.findIndex(s =>
+        isEqualTarget(s.target, activeSessionBuffer.targetData)
       );
       
-      if (!isAlreadyInHistory) {
-        const providerLabel = await getActiveProviderLabel();
-        currentSession = { 
-          target: activeSessionBuffer.targetData, 
-          text: activeSessionBuffer.accumulatedText || "", 
-          isFinished: !activeSessionBuffer.isStreaming,
-          providerLabel: providerLabel
-        };
-        sessionHistory.unshift(currentSession);
+      if (matchedIndex === -1) {
+        if (activeSessionBuffer.isStreaming || (sessionHistory.length === 0 && activeSessionBuffer.accumulatedText)) {
+          const providerLabel = await getActiveProviderLabel();
+          currentSession = { 
+            target: activeSessionBuffer.targetData, 
+            text: activeSessionBuffer.accumulatedText || "", 
+            isFinished: !activeSessionBuffer.isStreaming,
+            providerLabel: providerLabel
+          };
+          sessionHistory.unshift(currentSession);
+        }
       } else {
-        currentSession = sessionHistory[0];
-        currentSession.text = activeSessionBuffer.accumulatedText;
-        currentSession.isFinished = !activeSessionBuffer.isStreaming;
+        currentSession = sessionHistory[matchedIndex];
+        if (activeSessionBuffer.isStreaming) {
+          currentSession.text = activeSessionBuffer.accumulatedText;
+          currentSession.isFinished = false;
+        }
       }
     }
 
@@ -306,6 +396,7 @@ async function restoreState(tabId, activeSessionBuffer = null) {
     }
 
     sessionHistory.forEach((session, index) => {
+      const isLatest = index === 0;
       // All sessions collapsed by default
       const block = createSessionBlock(session, index);
       block.classList.add('collapsed');
@@ -340,8 +431,7 @@ async function restoreState(tabId, activeSessionBuffer = null) {
 }
 
 function saveState() {
-  if (!currentTabId) return;
-  const key = `state_${currentTabId}`;
+  const key = getSiteStorageKey();
   chrome.storage.local.set({ 
     [key]: { 
       history: sessionHistory.map(s => ({ 
@@ -352,7 +442,7 @@ function saveState() {
         providerLabel: s.providerLabel || ""
       })),
       timestamp: Date.now(),
-      url: currentSiteUrl // BUG-09: store URL to detect recycled tab IDs on next restore
+      url: currentSiteUrl
     } 
   });
 }
@@ -647,6 +737,9 @@ chrome.runtime.onMessage.addListener((message) => {
         currentSession.isFinished = true;
         parseAndRenderCards(currentSession.text, currentSession.block.querySelector('.session-content'));
         saveState();
+        if (currentTabId) {
+          chrome.runtime.sendMessage({ action: 'CLEAR_ACTIVE_SESSION', tabId: currentTabId });
+        }
         return;
       }
 
@@ -943,18 +1036,31 @@ function parseAndRenderCards(text, contentArea) {
       else if (maxIdx === pwIdx) type = "Playwright";
     }
 
-    // 2. If no explicit header was found nearby, fallback to syntax heuristics
-    if (type === "AI Suggestion") {
-      if (code.startsWith("//") || code.startsWith("/") || code.startsWith("(")) {
-        type = "XPath";
-      } else if (code.includes("page.") || code.includes("getBy") || code.includes("locator(")) {
-        type = "Playwright";
-      } else if (!code.includes(" ") && !code.startsWith("/") && (code.includes(".") || code.includes("#") || code.includes("["))) {
-        type = "CSS";
+    // 2. Split lines inside code block in case AI grouped multiple selectors together
+    const getSyntaxType = (codeStr) => {
+      if (codeStr.startsWith("//") || codeStr.startsWith("/") || codeStr.startsWith("(")) {
+        return "XPath";
+      } else if (codeStr.includes("page.") || codeStr.includes("getBy") || codeStr.includes("locator(")) {
+        return "Playwright";
+      } else if (!codeStr.includes(" ") && !codeStr.startsWith("/") && (codeStr.includes(".") || codeStr.includes("#") || codeStr.includes("["))) {
+        return "CSS";
       }
-    }
+      return "AI Suggestion";
+    };
 
-    addBlock(type, code);
+    const lines = code.split('\n').map(l => l.trim()).filter(Boolean);
+    lines.forEach(line => {
+      let cleanLine = line;
+      if (cleanLine.endsWith('`')) cleanLine = cleanLine.slice(0, -1).trim();
+      if (/^(#\s|\/\/\s|\/\*|\*)/.test(cleanLine)) return;
+      if (/^(Rules:|Task:|System:|Target Profile:)/i.test(cleanLine)) return;
+
+      let lineType = type;
+      if (lineType === "AI Suggestion") {
+        lineType = getSyntaxType(cleanLine);
+      }
+      addBlock(lineType, cleanLine);
+    });
   }
 
   // Also parse line-by-line inside explicit sections. This catches malformed
@@ -1129,7 +1235,11 @@ function updateHealButtonsState() {
 document.getElementById('clear-all-btn').addEventListener('click', () => {
   if (confirm('Clear history?')) {
     sessionHistory = [];
-    chrome.storage.local.remove(`state_${currentTabId}`);
+    const key = getSiteStorageKey();
+    chrome.storage.local.remove([key, `state_${currentTabId}`]);
+    if (currentTabId) {
+      chrome.runtime.sendMessage({ action: 'CLEAR_ACTIVE_SESSION', tabId: currentTabId });
+    }
     restoreState(currentTabId);
   }
 });
@@ -1184,6 +1294,9 @@ function initIntelligenceHub() {
       tabPanes.forEach(pane => {
         pane.classList.toggle('active', pane.id === `tab-${targetTab}`);
       });
+      if (targetTab === 'settings') {
+        refreshEngineAvailability();
+      }
     });
   });
 
@@ -1318,6 +1431,21 @@ function initCollapsibleSections() {
   });
 }
 
+async function checkOllamaAvailability(url = 'http://localhost:11434') {
+  try {
+    const cleanUrl = (url || 'http://localhost:11434').trim().replace(/\/$/, '');
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1200);
+    const resp = await fetch(`${cleanUrl}/api/tags`, { signal: controller.signal });
+    clearTimeout(timeout);
+    if (!resp.ok) return false;
+    const data = await resp.json();
+    return Array.isArray(data.models) && data.models.length > 0;
+  } catch (e) {
+    return false;
+  }
+}
+
 async function isChromeAiAvailable() {
   try {
     const getApi = () => {
@@ -1345,6 +1473,36 @@ async function isChromeAiAvailable() {
   }
 }
 
+async function refreshEngineAvailability() {
+  const select = document.getElementById('engine-select');
+  const nanoOpt = document.getElementById('option-gemini-nano');
+  const ollamaOpt = document.getElementById('option-ollama');
+  const ollamaUrl = document.getElementById('ollama-url')?.value?.trim() || 'http://localhost:11434';
+
+  const [chromeAiAvailable, ollamaAvailable] = await Promise.all([
+    isChromeAiAvailable(),
+    checkOllamaAvailability(ollamaUrl)
+  ]);
+
+  if (nanoOpt) nanoOpt.hidden = !chromeAiAvailable;
+  if (ollamaOpt) ollamaOpt.hidden = !ollamaAvailable;
+
+  const currentOpt = select?.querySelector(`option[value="${select.value}"]`);
+  if (!currentOpt || currentOpt.hidden) {
+    const firstAvailable = Array.from(select.options).find(opt => !opt.hidden);
+    if (firstAvailable) {
+      select.value = firstAvailable.value;
+      chrome.storage.local.get(['aiConfig'], (res) => {
+        const cfg = res.aiConfig || {};
+        cfg.engine = select.value;
+        chrome.storage.local.set({ aiConfig: cfg });
+      });
+    }
+  }
+
+  return { chromeAiAvailable, ollamaAvailable };
+}
+
 async function initEngineConfig() {
   const select = document.getElementById('engine-select');
   const saveBtn = document.getElementById('save-config-btn');
@@ -1353,16 +1511,11 @@ async function initEngineConfig() {
   const openaiSelect = document.getElementById('openai-model-select');
   const anthropicSelect = document.getElementById('anthropic-model-select');
   const googleSelect = document.getElementById('google-model-select');
+  const scopeSelect = document.getElementById('scope-select');
   const refreshOllamaBtn = document.getElementById('refresh-ollama-btn');
   const refreshOpenaiBtn = document.getElementById('refresh-openai-btn');
   const refreshAnthropicBtn = document.getElementById('refresh-anthropic-btn');
   const refreshGoogleBtn = document.getElementById('refresh-google-btn');
-
-  const chromeAiAvailable = await isChromeAiAvailable();
-  if (!chromeAiAvailable) {
-    const nanoOpt = document.getElementById('option-gemini-nano');
-    if (nanoOpt) nanoOpt.remove();
-  }
 
   const updateVisibility = (val) => {
     configs.forEach(c => c.style.display = 'none');
@@ -1384,17 +1537,24 @@ async function initEngineConfig() {
     }
   };
 
-  chrome.storage.local.get(['aiConfig'], (res) => {
+  chrome.storage.local.get(['sidePanelScope', 'aiConfig'], async (res) => {
+    if (scopeSelect) {
+      scopeSelect.value = res.sidePanelScope || 'tab';
+    }
+
     const config = res.aiConfig || { engine: 'ollama', ollamaUrl: 'http://localhost:11434' };
-    
+    if (config.ollamaUrl) document.getElementById('ollama-url').value = config.ollamaUrl;
+
+    const { chromeAiAvailable, ollamaAvailable } = await refreshEngineAvailability();
+
     if (config.engine === 'gemini-nano' && !chromeAiAvailable) {
-      config.engine = 'ollama';
+      config.engine = ollamaAvailable ? 'ollama' : 'openai';
+    } else if (config.engine === 'ollama' && !ollamaAvailable) {
+      config.engine = chromeAiAvailable ? 'gemini-nano' : 'openai';
     }
 
     select.value = config.engine;
-    
-    if (config.ollamaUrl) document.getElementById('ollama-url').value = config.ollamaUrl;
-    
+
     // Temporarily store saved model name to pre-select after fetch
     if (config.ollamaModel) ollamaSelect.dataset.savedModel = config.ollamaModel;
     if (config.openaiModel && isOpenAIModelAllowedForDropdown(config.openaiModel)) {
@@ -1406,7 +1566,7 @@ async function initEngineConfig() {
     if (config.anthropicModel) anthropicSelect.dataset.savedModel = config.anthropicModel;
     if (config.googleModel) googleSelect.dataset.savedModel = config.googleModel;
 
-    updateVisibility(config.engine);
+    updateVisibility(select.value);
   });
 
   chrome.storage.session.get(['openaiKey', 'anthropicKey', 'googleKey'], (res) => {
@@ -1420,10 +1580,14 @@ async function initEngineConfig() {
   });
 
   select.addEventListener('change', (e) => updateVisibility(e.target.value));
-  refreshOllamaBtn.addEventListener('click', () => fetchOllamaModels());
+  refreshOllamaBtn.addEventListener('click', async () => {
+    await refreshEngineAvailability();
+    fetchOllamaModels();
+  });
   refreshOpenaiBtn.addEventListener('click', () => fetchOpenAIModels());
   refreshAnthropicBtn.addEventListener('click', () => fetchAnthropicModels());
   refreshGoogleBtn.addEventListener('click', () => fetchGoogleModels());
+  document.getElementById('ollama-url').addEventListener('change', () => refreshEngineAvailability());
   document.getElementById('openai-key').addEventListener('change', () => fetchOpenAIModels());
   document.getElementById('anthropic-key').addEventListener('change', () => fetchAnthropicModels());
   document.getElementById('google-key').addEventListener('change', () => fetchGoogleModels());
@@ -1437,11 +1601,13 @@ async function initEngineConfig() {
       anthropicModel: anthropicSelect.value,
       googleModel: googleSelect.value
     };
+    const sidePanelScope = scopeSelect ? scopeSelect.value : 'tab';
     const openaiKey = document.getElementById('openai-key').value.trim();
     const anthropicKey = document.getElementById('anthropic-key').value.trim();
     const googleKey = document.getElementById('google-key').value.trim();
 
-    chrome.storage.local.set({ aiConfig }, () => {
+    chrome.storage.local.set({ aiConfig, sidePanelScope }, () => {
+      chrome.runtime.sendMessage({ action: 'UPDATE_PANEL_SCOPE', scope: sidePanelScope });
       chrome.storage.session.set({ openaiKey, anthropicKey, googleKey }, () => {
         const orig = saveBtn.innerText;
         saveBtn.innerText = "Settings Saved!";
@@ -1471,6 +1637,14 @@ function setModelOptions(select, models, savedModel, emptyLabel = 'Select Model.
     if (id === savedModel) opt.selected = true;
     select.appendChild(opt);
   });
+}
+
+function isOpenAIModelAllowedForDropdown(modelObj) {
+  if (!modelObj) return false;
+  const id = typeof modelObj === 'string' ? modelObj : (modelObj.id || modelObj.name || '');
+  if (!id || !isTaskSuitableModel(id)) return false;
+  if (/-\d{4}/.test(id)) return false;
+  return true;
 }
 
 // Rule 1: Exclude non-text/code specialized endpoints (audio, images, embeddings, moderation, etc.)

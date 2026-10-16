@@ -81,17 +81,56 @@ function validateExternalAiConfig(config) {
   return null;
 }
 
-// ─── Side Panel Behavior ──────────────────────────────────────────────────────
-if (chrome.sidePanel?.setPanelBehavior) {
-  chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
+// ─── Side Panel Behavior & Scope (FEAT-P7) ────────────────────────────────────
+let currentPanelScope = 'tab';
+
+async function applySidePanelScope(scope) {
+  currentPanelScope = scope || 'tab';
+  if (currentPanelScope === 'all') {
+    if (chrome.sidePanel?.setPanelBehavior) {
+      await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
+    }
+    if (chrome.sidePanel?.setOptions) {
+      await chrome.sidePanel.setOptions({ path: 'sidepanel.html', enabled: true }).catch(() => {});
+    }
+    // Enable for all existing tabs so per-tab restrictions from tab-only mode are removed
+    const tabs = await chrome.tabs.query({}).catch(() => []);
+    for (const tab of tabs) {
+      if (tab.id) {
+        chrome.sidePanel.setOptions({ tabId: tab.id, path: 'sidepanel.html', enabled: true }).catch(() => {});
+      }
+    }
+  } else {
+    // Tab-only mode: disable global default so Chrome hides the panel on other tabs
+    if (chrome.sidePanel?.setPanelBehavior) {
+      await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false }).catch(() => {});
+    }
+    if (chrome.sidePanel?.setOptions) {
+      await chrome.sidePanel.setOptions({ enabled: false }).catch(() => {});
+    }
+  }
 }
+
+// Always open side panel per-tab using tabId.
+// This ensures that closing the side panel on one tab NEVER closes the side panel on other tabs!
+chrome.action.onClicked.addListener((tab) => {
+  if (!tab || !tab.id) return;
+  chrome.sidePanel.setOptions({ tabId: tab.id, path: 'sidepanel.html', enabled: true }).catch(() => {});
+  chrome.sidePanel.open({ tabId: tab.id }).catch((err) => {
+    console.warn('QA Assistant: tab open error:', err);
+  });
+});
+
+chrome.storage.local.get(['sidePanelScope'], (data) => {
+  applySidePanelScope(data.sidePanelScope || 'tab');
+});
 
 // ─── Install / Update ─────────────────────────────────────────────────────────
 chrome.runtime.onInstalled.addListener(() => {
   console.log("QA Assistant: Service Worker Active.");
-  if (chrome.sidePanel?.setPanelBehavior) {
-    chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
-  }
+  chrome.storage.local.get(['sidePanelScope'], (data) => {
+    applySidePanelScope(data.sidePanelScope || 'tab');
+  });
   syncKnowledgeSeed();
 });
 
@@ -138,6 +177,9 @@ chrome.runtime.onConnect.addListener((port) => {
       if (activeSessionsByTab[tabId]) {
         activeSessionsByTab[tabId].isInspecting = false;
         persistSessionState();
+      }
+      if (tabId) {
+        chrome.tabs.sendMessage(tabId, { action: 'CLEAR_HIGHLIGHTS' }).catch(() => {});
         chrome.tabs.sendMessage(tabId, { action: 'STOP_INSPECTION' }).catch(() => {});
       }
     });
@@ -180,7 +222,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (activeSessionsByTab[tabId]) {
       if (message.data === "FinishedSuccessfullyMark") {
         activeSessionsByTab[tabId].isStreaming = false;
-        activeSessionsByTab[tabId].accumulatedText += message.data;
+      } else if (message.isChunk) {
+        activeSessionsByTab[tabId].accumulatedText = (activeSessionsByTab[tabId].accumulatedText || "") + message.data;
       } else {
         activeSessionsByTab[tabId].accumulatedText = message.data;
       }
@@ -200,6 +243,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   } else if (message.action === 'CLEAR_ACTIVE_SESSION') {
     delete activeSessionsByTab[tabId];
     persistSessionState();
+  } else if (message.action === 'UPDATE_PANEL_SCOPE') {
+    applySidePanelScope(message.scope);
   } else if (message.action === 'REFINE_LOCATOR') {
     handleRefinementRequest(tabId, message.data);
   }
