@@ -37,6 +37,26 @@ function clearVerificationOverlays() {
   overlays.forEach(o => o.remove());
 }
 
+function clearVisualHighlights() {
+  const selection = document.getElementById('qa-selection-overlay');
+  if (selection) selection.style.display = 'none';
+
+  const hover = document.getElementById('qa-hover-overlay');
+  if (hover) hover.style.display = 'none';
+
+  document.querySelectorAll('.qa-assistant-highlight').forEach(el => {
+    el.classList.remove('qa-assistant-highlight');
+  });
+
+  clearVerificationOverlays();
+  hideToast();
+}
+
+function clearAllPageVisuals() {
+  stopInspection();
+  clearVisualHighlights();
+}
+
 /**
  * Translates Playwright locator expressions to native CSS/XPath queries.
  * Handles getByRole, getByTestId, getByText, getByLabel, getByPlaceholder,
@@ -113,9 +133,9 @@ function playwrightToNative(query) {
   if (phM) return { css: `[placeholder="${cssString(phM[1])}"]` };
 
   // ── page.locator('selector') ───────────────────────────────────────────────
-  const locM = q.match(/\.locator\(['"]([^'"]+)['"]\)/);
+  const locM = q.match(/\.locator\(\s*(["'])([\s\S]+?)\1\s*\)/);
   if (locM) {
-    const sel = locM[1];
+    const sel = locM[2].trim();
     if (sel.startsWith('//') || sel.startsWith('(') || sel.startsWith('./')) return { xpath: sel };
     return { css: sel };
   }
@@ -262,7 +282,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     startInspection();
     sendResponse({ status: 'started' });
   } else if (message.action === 'STOP_INSPECTION') {
-    stopInspection();
+    clearAllPageVisuals();
     sendResponse({ status: 'stopped' });
   } else if (message.action === 'CLEAR_SELECTION') {
     const selectionOverlay = document.getElementById('qa-selection-overlay');
@@ -270,14 +290,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     clearVerificationOverlays();
     sendResponse({ status: 'cleared' });
   } else if (message.action === 'CLEAR_HIGHLIGHTS') {
-    const selection = document.getElementById('qa-selection-overlay');
-    if (selection) selection.style.display = 'none';
-
-    document.querySelectorAll('.qa-assistant-highlight').forEach(el => {
-      el.classList.remove('qa-assistant-highlight');
-    });
-
-    clearVerificationOverlays();
+    clearVisualHighlights();
     sendResponse({ status: 'cleared' });
   } else if (message.action === 'VERIFY_LOCATOR') {
     const result = verifyLocator(message.type, message.query);

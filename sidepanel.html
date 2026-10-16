@@ -665,13 +665,27 @@
           <svg class="section-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
         </button>
         <div class="section-body">
-          <div style="background:var(--card-inner-bg); padding:14px; border-radius:10px; border:1px solid var(--border);">
+          <div style="background:var(--card-inner-bg); padding:14px; border-radius:10px; border:1px solid var(--border); margin-bottom:16px;">
             <label class="intel-label">Color Scheme</label>
             <select id="theme-select" class="manual-select" style="width:100%; padding: 10px; font-size: 0.8rem;">
               <option value="system">Auto (Match Chrome / System)</option>
               <option value="dark">Dark Mode</option>
               <option value="light">Light Mode</option>
             </select>
+          </div>
+
+          <div style="background:var(--card-inner-bg); padding:14px; border-radius:10px; border:1px solid var(--border);">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+              <label class="intel-label" style="margin-bottom:0;">Side Panel Scope</label>
+              <span id="scope-status" style="font-size:0.75rem; color:var(--accent); display:none; font-weight:600;">✓ Applied automatically</span>
+            </div>
+            <select id="scope-select" class="manual-select" style="width:100%; padding: 10px; font-size: 0.8rem; margin-top:8px;">
+              <option value="tab">Current Tab Only (Default)</option>
+              <option value="all">All Tabs (Follow Active Tab)</option>
+            </select>
+            <div style="font-size:0.7rem; color:var(--text-dim); margin-top:6px;">
+              "Current Tab Only" keeps the sidebar only on this tab; other tabs will not show it. "All Tabs" keeps it open across tabs with automatic context switching.
+            </div>
           </div>
         </div>
       </section>
@@ -686,11 +700,12 @@
       </button>
       <div class="section-body">
       <div style="background:rgba(0,0,0,0.2); padding:14px; border-radius:10px; border:1px solid rgba(255,255,255,0.05); margin-bottom:16px;">
+
         <div style="margin-bottom:12px;">
           <label class="intel-label">Active Engine</label>
           <select id="engine-select" class="manual-select" style="width:100%; padding: 10px; font-size: 0.8rem;">
             <option value="gemini-nano" id="option-gemini-nano">Chrome Built-in (Gemini Nano)</option>
-            <option value="ollama">Ollama</option>
+            <option value="ollama" id="option-ollama">Ollama</option>
             <option value="openai">OpenAI</option>
             <option value="anthropic">Anthropic</option>
             <option value="google">Google</option>
@@ -699,7 +714,13 @@
 
         <!-- Ollama Config -->
         <div id="config-ollama" class="engine-config" style="display:none; flex-direction:column; gap:10px;">
-          <input type="text" id="ollama-url" placeholder="Endpoint (e.g. http://localhost:11434)" value="http://localhost:11434" style="width:100%; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:8px; padding:10px; font-size:0.8rem;">
+          <div style="display:flex; gap:8px;">
+            <input type="text" id="ollama-url" placeholder="Endpoint (e.g. http://localhost:11434)" value="http://localhost:11434" style="flex:1; min-width:0; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:8px; padding:10px; font-size:0.8rem;">
+            <button id="discover-ollama-btn" type="button" style="background:var(--btn-primary-bg); color:var(--text); border:1px solid var(--border); border-radius:8px; padding:8px 10px; font-size:0.75rem; cursor:pointer; white-space:nowrap;">Discover Local LLM</button>
+          </div>
+          <div id="ollama-status-notice" style="display:none; font-size:0.75rem; color:#f87171; line-height:1.4;">
+            Ollama is offline or unreachable. Enter a custom endpoint or run <code>ollama serve</code>, then discover again.
+          </div>
           <div style="display:flex; gap:8px; align-items:center;">
             <select id="ollama-model-select" style="flex:1; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:8px; padding:10px; font-size:0.8rem; outline:none;">
               <option value="">Select Model...</option>

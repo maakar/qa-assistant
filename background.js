@@ -22,6 +22,36 @@ async function persistSessionState() {
   }
 }
 
+// Serialize site-history mutations in the service worker so multiple panels cannot
+// overwrite each other's snapshots. Deleted IDs are retained as tombstones.
+const siteStateQueues = new Map();
+
+function generateStoredSessionId() {
+  return 'sess_' + Date.now() + '_' + Math.random().toString(36).slice(2, 10);
+}
+
+function queueSiteStateMutation(key, mutator) {
+  const previous = siteStateQueues.get(key) || Promise.resolve();
+  const next = previous.then(async () => {
+    const result = await chrome.storage.local.get([key]);
+    const state = result[key] || { history: [], deletedIds: [] };
+    state.history = (state.history || []).map(session => ({
+      ...session,
+      id: session.id || generateStoredSessionId()
+    }));
+    state.deletedIds = state.deletedIds || [];
+    await mutator(state);
+    state.timestamp = Date.now();
+    await chrome.storage.local.set({ [key]: state });
+    chrome.runtime.sendMessage({ action: 'SITE_STATE_CHANGED', key }).catch(() => {});
+    return state;
+  }).finally(() => {
+    if (siteStateQueues.get(key) === next) siteStateQueues.delete(key);
+  });
+  siteStateQueues.set(key, next);
+  return next;
+}
+
 // Hydrate immediately on every SW startup
 hydrateSessionState();
 
@@ -81,17 +111,65 @@ function validateExternalAiConfig(config) {
   return null;
 }
 
-// ─── Side Panel Behavior ──────────────────────────────────────────────────────
-if (chrome.sidePanel?.setPanelBehavior) {
-  chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
+// ─── Side Panel Behavior & Scope (FEAT-P7) ────────────────────────────────────
+let currentPanelScope = 'tab';
+const openPanelTabs = new Set();
+
+async function applySidePanelScope(scope) {
+  currentPanelScope = scope || 'tab';
+  if (currentPanelScope === 'all') {
+    if (chrome.sidePanel?.setPanelBehavior) {
+      await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
+    }
+    if (chrome.sidePanel?.setOptions) {
+      await chrome.sidePanel.setOptions({ path: 'sidepanel.html', enabled: true }).catch(() => {});
+    }
+    const tabs = await chrome.tabs.query({}).catch(() => []);
+    for (const tab of tabs) {
+      if (tab.id) {
+        chrome.sidePanel.setOptions({ tabId: tab.id, path: 'sidepanel.html', enabled: true }).catch(() => {});
+      }
+    }
+  } else {
+    // Tab-only mode: disable global default so unopened tabs do not show panel
+    if (chrome.sidePanel?.setPanelBehavior) {
+      await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false }).catch(() => {});
+    }
+    if (chrome.sidePanel?.setOptions) {
+      await chrome.sidePanel.setOptions({ enabled: false }).catch(() => {});
+    }
+    // Reconcile tabs: for any tab without an active open panel, disable its override
+    const tabs = await chrome.tabs.query({}).catch(() => []);
+    for (const tab of tabs) {
+      if (tab.id && !openPanelTabs.has(tab.id)) {
+        chrome.sidePanel.setOptions({ tabId: tab.id, enabled: false }).catch(() => {});
+      }
+    }
+  }
 }
+
+chrome.action.onClicked.addListener((tab) => {
+  if (!tab || !tab.id) return;
+  if (currentPanelScope === 'tab') {
+    chrome.sidePanel.setOptions({ tabId: tab.id, path: 'sidepanel.html', enabled: true }).catch(() => {});
+    chrome.sidePanel.open({ tabId: tab.id }).catch((err) => {
+      console.warn('QA Assistant: tab open error:', err);
+    });
+  } else {
+    chrome.sidePanel.open({ windowId: tab.windowId }).catch(() => {});
+  }
+});
+
+chrome.storage.local.get(['sidePanelScope'], (data) => {
+  applySidePanelScope(data.sidePanelScope || 'tab');
+});
 
 // ─── Install / Update ─────────────────────────────────────────────────────────
 chrome.runtime.onInstalled.addListener(() => {
   console.log("QA Assistant: Service Worker Active.");
-  if (chrome.sidePanel?.setPanelBehavior) {
-    chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
-  }
+  chrome.storage.local.get(['sidePanelScope'], (data) => {
+    applySidePanelScope(data.sidePanelScope || 'tab');
+  });
   syncKnowledgeSeed();
 });
 
@@ -134,10 +212,15 @@ async function syncKnowledgeSeed() {
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name.startsWith('sidepanel_')) {
     const tabId = parseInt(port.name.split('_')[1]);
+    openPanelTabs.add(tabId);
     port.onDisconnect.addListener(() => {
+      openPanelTabs.delete(tabId);
       if (activeSessionsByTab[tabId]) {
         activeSessionsByTab[tabId].isInspecting = false;
         persistSessionState();
+      }
+      if (tabId) {
+        chrome.tabs.sendMessage(tabId, { action: 'CLEAR_HIGHLIGHTS' }).catch(() => {});
         chrome.tabs.sendMessage(tabId, { action: 'STOP_INSPECTION' }).catch(() => {});
       }
     });
@@ -159,8 +242,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return true;
     }
 
+    // One request ID is shared by the live buffer and every panel rendering it.
+    const sessionId = generateStoredSessionId();
     activeSessionsByTab[tabId] = {
       ...activeSessionsByTab[tabId],
+      sessionId,
       targetData,
       accumulatedText: "",
       isStreaming: true,
@@ -171,6 +257,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     chrome.runtime.sendMessage({
       action: 'ANALYSIS_START',
       data: message.data,
+      sessionId,
       tabId: tabId
     }).catch(() => {});
 
@@ -180,7 +267,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (activeSessionsByTab[tabId]) {
       if (message.data === "FinishedSuccessfullyMark") {
         activeSessionsByTab[tabId].isStreaming = false;
-        activeSessionsByTab[tabId].accumulatedText += message.data;
+      } else if (message.isChunk) {
+        activeSessionsByTab[tabId].accumulatedText = (activeSessionsByTab[tabId].accumulatedText || "") + message.data;
       } else {
         activeSessionsByTab[tabId].accumulatedText = message.data;
       }
@@ -200,6 +288,68 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   } else if (message.action === 'CLEAR_ACTIVE_SESSION') {
     delete activeSessionsByTab[tabId];
     persistSessionState();
+  } else if (message.action === 'UPDATE_PANEL_SCOPE') {
+    applySidePanelScope(message.scope);
+  } else if (message.action === 'GET_SITE_STATE') {
+    const key = message.key;
+    const legacyKey = message.legacyKey;
+    (async () => {
+      const result = await chrome.storage.local.get([key, legacyKey]);
+      let state = result[key];
+      if (!state && result[legacyKey]?.url === message.siteHost) {
+        state = result[legacyKey];
+      }
+      state = state || { history: [], deletedIds: [] };
+      state.history = (state.history || []).map(session => ({
+        ...session,
+        id: session.id || generateStoredSessionId()
+      }));
+      sendResponse(state);
+    })();
+  } else if (message.action === 'UPSERT_SITE_SESSIONS') {
+    queueSiteStateMutation(message.key, async (state) => {
+      const deleted = new Set(state.deletedIds || []);
+      const incomingList = message.history || [];
+      for (let i = incomingList.length - 1; i >= 0; i--) {
+        const incoming = incomingList[i];
+        const session = { ...incoming, id: incoming.id || generateStoredSessionId() };
+        if (deleted.has(session.id)) continue;
+        const index = state.history.findIndex(existing => existing.id === session.id);
+        if (index >= 0) {
+          const existing = state.history[index];
+          // A delayed panel write must not roll a completed request back to empty.
+          if (existing.isFinished && !session.isFinished) {
+            state.history[index] = {
+              ...existing,
+              title: session.title || existing.title,
+              providerLabel: session.providerLabel || existing.providerLabel
+            };
+            continue;
+          }
+          state.history[index] = {
+            ...existing,
+            ...session,
+            text: session.text || existing.text,
+            title: session.title || existing.title,
+            providerLabel: session.providerLabel || existing.providerLabel
+          };
+        } else state.history.unshift(session);
+      }
+      state.url = message.siteHost;
+    }).then(() => sendResponse({ ok: true }));
+  } else if (message.action === 'DELETE_SITE_SESSION') {
+    queueSiteStateMutation(message.key, async (state) => {
+      state.history = state.history.filter(session => session.id !== message.sessionId);
+      if (message.sessionId && !state.deletedIds.includes(message.sessionId)) {
+        state.deletedIds.push(message.sessionId);
+      }
+    }).then(() => sendResponse({ ok: true }));
+  } else if (message.action === 'CLEAR_SITE_STATE') {
+    queueSiteStateMutation(message.key, async (state) => {
+      state.deletedIds = [...new Set([...(state.deletedIds || []), ...state.history.map(s => s.id).filter(Boolean)])];
+      state.history = [];
+      state.url = message.siteHost;
+    }).then(() => sendResponse({ ok: true }));
   } else if (message.action === 'REFINE_LOCATOR') {
     handleRefinementRequest(tabId, message.data);
   }

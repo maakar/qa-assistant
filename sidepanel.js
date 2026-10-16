@@ -4,6 +4,8 @@ let currentTabId = null;
 let currentSiteUrl = "";
 let sessionHistory = []; // Array of session objects
 let currentSession = null;
+let ownedSessionId = null; // Only this panel may write the active request's results.
+let restoreGeneration = 0;
 let isHealing = false; // Global lock for AI refinement operations
 
 const ICON_DELETE = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6M8 6V4c0-1 1-2 2-2h4c1 0 1 1 2 2v2"/></svg>';
@@ -16,6 +18,75 @@ function safeJsonParse(value, fallback = null) {
     console.warn('[QA] Failed to parse JSON payload:', err);
     return fallback;
   }
+}
+
+function generateSessionId() {
+  return 'sess_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+}
+
+function isEqualTarget(a, b) {
+  if (!a || !b) return false;
+  if (a.tagName !== b.tagName) return false;
+  if ((a.id || '') !== (b.id || '')) return false;
+  if ((a.testId || '') !== (b.testId || '')) return false;
+  if ((a.textSnippet || '') !== (b.textSnippet || '')) return false;
+
+  const sortKeys = (obj) => {
+    if (!obj || typeof obj !== 'object') return obj;
+    return Object.keys(obj).sort().reduce((acc, k) => {
+      acc[k] = sortKeys(obj[k]);
+      return acc;
+    }, {});
+  };
+  return JSON.stringify(sortKeys(a)) === JSON.stringify(sortKeys(b));
+}
+
+function findActiveSessionIndex(history, active) {
+  return history.findIndex(session => active.sessionId
+    ? session.id === active.sessionId
+    : isEqualTarget(session.target, active.targetData));
+}
+
+function splitCodeBlockIntoExpressions(code) {
+  const rawLines = code.split('\n');
+  const expressions = [];
+  let current = '';
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+
+  for (const rawLine of rawLines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    // Filter true comments without discarding XPath (/*[@id...], //button) or CSS (*[data-testid...], #id)
+    const isComment = /^(#\s+|\/\/\s+|\/\*(?!\*?[@\w\[\/])|\*\s+)/.test(line);
+    if (isComment && !current) continue;
+    if (/^(Rules:|Task:|System:|Target Profile:)/i.test(line)) continue;
+
+    if (current) {
+      current += ' ' + line;
+    } else {
+      current = line;
+    }
+
+    for (const ch of line) {
+      if (ch === '(') parenDepth++;
+      else if (ch === ')') parenDepth = Math.max(0, parenDepth - 1);
+      else if (ch === '{') braceDepth++;
+      else if (ch === '}') braceDepth = Math.max(0, braceDepth - 1);
+      else if (ch === '[') bracketDepth++;
+      else if (ch === ']') bracketDepth = Math.max(0, bracketDepth - 1);
+    }
+
+    if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) {
+      expressions.push(current.trim());
+      current = '';
+    }
+  }
+
+  if (current) expressions.push(current.trim());
+  return expressions;
 }
 
 function showPanelError(message) {
@@ -92,6 +163,32 @@ function initThemeSystem() {
     });
   }
 
+  // Side Panel Scope controls: applies immediately on change without needing a manual save button
+  const scopeSelect = document.getElementById('scope-select');
+  const scopeStatus = document.getElementById('scope-status');
+
+  chrome.storage.local.get(['sidePanelScope'], (res) => {
+    const scope = res.sidePanelScope || 'tab';
+    if (scopeSelect) scopeSelect.value = scope;
+  });
+
+  if (scopeSelect) {
+    scopeSelect.addEventListener('change', async (e) => {
+      const scope = e.target.value;
+      chrome.storage.local.set({ sidePanelScope: scope }, () => {
+        chrome.runtime.sendMessage({ action: 'UPDATE_PANEL_SCOPE', scope });
+      });
+
+      if (scopeStatus) {
+        scopeStatus.style.display = 'inline';
+        scopeStatus.innerText = scope === 'all' ? '✓ Applied: Follow All Tabs' : '✓ Applied: Current Tab Only';
+        setTimeout(() => { scopeStatus.style.display = 'none'; }, 2500);
+      }
+
+      // Mode updated without forcing window-level takeover so per-tab panels remain independent
+    });
+  }
+
   // Auto react to system color scheme changes if set to 'system'
   if (window.matchMedia) {
     window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
@@ -103,6 +200,13 @@ function initThemeSystem() {
     });
   }
 }
+
+window.addEventListener('beforeunload', () => {
+  if (currentTabId) {
+    chrome.tabs.sendMessage(currentTabId, { action: 'CLEAR_HIGHLIGHTS' }).catch(() => {});
+    chrome.tabs.sendMessage(currentTabId, { action: 'STOP_INSPECTION' }).catch(() => {});
+  }
+});
 
 // Initialize the side panel and tools
 function init() {
@@ -137,6 +241,66 @@ function init() {
   setupManualTool();
   setupFreezeTool();
   refreshMemoryUI();
+
+  // FEAT-P7: Tab switching listener
+  const isDetached = params.get('mode') === 'detached';
+  if (!isDetached && chrome.tabs?.onActivated) {
+    chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
+      const currentWin = await chrome.windows.getCurrent().catch(() => null);
+      if (currentWin && windowId !== currentWin.id) return;
+
+      const data = await chrome.storage.local.get(['sidePanelScope']);
+      const scope = data.sidePanelScope || 'tab';
+
+      if (scope === 'tab') {
+        return;
+      }
+
+      if (scope === 'all') {
+        if (currentTabId === tabId) return;
+
+        if (currentTabId) {
+          chrome.runtime.sendMessage({ action: 'STOP_INSPECTION_SIGNAL', tabId: currentTabId });
+          chrome.tabs.sendMessage(currentTabId, { action: 'STOP_INSPECTION' }).catch(() => {});
+          setInspectionUIState(false);
+        }
+
+        restoreGeneration++;
+        ownedSessionId = null;
+        currentSession = null;
+        sessionHistory = [];
+        currentTabId = tabId;
+        chrome.tabs.get(tabId, (tab) => {
+          if (chrome.runtime.lastError || !tab) return;
+          updateTabInfo(tab);
+          syncWithBackground(tabId);
+        });
+      }
+    });
+
+    chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+      if (tabId !== currentTabId) return;
+      if (changeInfo.status === 'complete' || changeInfo.url) {
+        let newHost = "";
+        try {
+          newHost = new URL(tab.url).hostname;
+        } catch (e) {
+          newHost = "Internal Page";
+        }
+        const hostChanged = newHost !== currentSiteUrl;
+        updateTabInfo(tab);
+        if (hostChanged) {
+          restoreGeneration++;
+          ownedSessionId = null;
+          currentSession = null;
+          sessionHistory = [];
+          syncWithBackground(tabId);
+        }
+      }
+    });
+
+    // Cross-tab site history synchronization is emitted by the shared service-worker owner.
+  }
 }
 
 async function ensureContentScriptInjected(tabId) {
@@ -216,14 +380,20 @@ function saveToKnowledgeBase(data) {
 
 async function syncWithBackground(tabId) {
   chrome.runtime.sendMessage({ action: 'GET_ACTIVE_SESSION', tabId: tabId }, (active) => {
+    if (chrome.runtime.lastError || tabId !== currentTabId) return;
     if (active) {
+      if (active.sessionId && active.sessionId === ownedSessionId && currentSession?.id === active.sessionId &&
+          active.isStreaming) return; // Do not replace a live session with a stale restore.
       if (active.isInspecting) setInspectionUIState(true);
       if (active.isStreaming || active.accumulatedText) {
+        ownedSessionId = active.isStreaming ? (active.sessionId || null) : null;
         restoreState(tabId, active);
       } else {
+        ownedSessionId = null;
         restoreState(tabId);
       }
     } else {
+      ownedSessionId = null;
       restoreState(tabId);
     }
   });
@@ -258,54 +428,77 @@ function updateTabInfo(tab) {
   }
 }
 
-async function restoreState(tabId, activeSessionBuffer = null) {
-  const key = `state_${tabId}`;
-  chrome.storage.local.get([key], async (result) => {
-    const stored = result[key];
+function getSiteStorageKey() {
+  const host = currentSiteUrl && currentSiteUrl !== 'Internal Page' ? currentSiteUrl : `tab_${currentTabId}`;
+  return `state_site_${host}`;
+}
 
-    // BUG-09: If the stored URL doesn't match the current URL, the tab ID was recycled.
-    // Clear the stale session rather than restore data from a different site.
-    if (stored && stored.url && currentSiteUrl && stored.url !== currentSiteUrl) {
-      console.warn(`[QA] Tab ${tabId} URL changed (${stored.url} → ${currentSiteUrl}). Clearing stale session.`);
-      chrome.storage.local.remove(key);
-      sessionHistory = [];
-    } else {
-      sessionHistory = (stored && stored.history) || [];
-    }
+async function restoreState(tabId, activeSessionBuffer = null) {
+  const key = getSiteStorageKey();
+  const generation = ++restoreGeneration;
+  const legacyKey = `state_${tabId}`;
+
+  chrome.runtime.sendMessage({
+    action: 'GET_SITE_STATE',
+    key,
+    legacyKey,
+    siteHost: currentSiteUrl
+  }, async (stored) => {
+    if (chrome.runtime.lastError || generation !== restoreGeneration ||
+        tabId !== currentTabId || key !== getSiteStorageKey() ||
+        (ownedSessionId && activeSessionBuffer?.sessionId !== ownedSessionId)) return;
+    sessionHistory = (stored && stored.history) || [];
     const container = document.getElementById('results-container');
     if (!container) return;
     
     container.innerHTML = '';
     
     // Handle active buffer from background
-    if (activeSessionBuffer && activeSessionBuffer.targetData) {
-      // BUG-07 fix: search ALL history entries, not just [0], to prevent duplicate session creation
-      const isAlreadyInHistory = sessionHistory.some(s =>
-        JSON.stringify(s.target) === JSON.stringify(activeSessionBuffer.targetData)
-      );
+    let matchedSession = null;
+    let persistRecoveredCompletion = false;
+    if (activeSessionBuffer && activeSessionBuffer.targetData &&
+        !(activeSessionBuffer.sessionId && stored?.deletedIds?.includes(activeSessionBuffer.sessionId))) {
+      const matchedIndex = findActiveSessionIndex(sessionHistory, activeSessionBuffer);
       
-      if (!isAlreadyInHistory) {
-        const providerLabel = await getActiveProviderLabel();
-        currentSession = { 
-          target: activeSessionBuffer.targetData, 
-          text: activeSessionBuffer.accumulatedText || "", 
-          isFinished: !activeSessionBuffer.isStreaming,
-          providerLabel: providerLabel
-        };
-        sessionHistory.unshift(currentSession);
+      if (matchedIndex === -1) {
+        if (activeSessionBuffer.isStreaming || activeSessionBuffer.accumulatedText) {
+          const providerLabel = await getActiveProviderLabel();
+          if (generation !== restoreGeneration || tabId !== currentTabId ||
+              key !== getSiteStorageKey() ||
+              (ownedSessionId && activeSessionBuffer.sessionId !== ownedSessionId)) return;
+          currentSession = { 
+            id: activeSessionBuffer.sessionId || generateSessionId(),
+            target: activeSessionBuffer.targetData, 
+            text: activeSessionBuffer.accumulatedText || "", 
+            isFinished: !activeSessionBuffer.isStreaming,
+            providerLabel: providerLabel
+          };
+          sessionHistory.unshift(currentSession);
+          matchedSession = currentSession;
+          persistRecoveredCompletion = currentSession.isFinished && !!currentSession.text;
+        }
       } else {
-        currentSession = sessionHistory[0];
-        currentSession.text = activeSessionBuffer.accumulatedText;
-        currentSession.isFinished = !activeSessionBuffer.isStreaming;
+        currentSession = sessionHistory[matchedIndex];
+        matchedSession = currentSession;
+        if (activeSessionBuffer.isStreaming) {
+          currentSession.text = activeSessionBuffer.accumulatedText;
+          currentSession.isFinished = false;
+        } else if (!currentSession.isFinished && activeSessionBuffer.accumulatedText) {
+          currentSession.text = activeSessionBuffer.accumulatedText;
+          currentSession.isFinished = true;
+          persistRecoveredCompletion = true;
+        }
       }
     }
 
+    if (!matchedSession && sessionHistory.length === 0) currentSession = null;
     if (sessionHistory.length === 0) {
       container.innerHTML = '<div class="empty-state" style="text-align: center; opacity: 0.5; margin-top: 40px;"><p>Select an element to target.</p></div>';
       return;
     }
 
     sessionHistory.forEach((session, index) => {
+      const isLatest = index === 0;
       // All sessions collapsed by default
       const block = createSessionBlock(session, index);
       block.classList.add('collapsed');
@@ -331,29 +524,36 @@ async function restoreState(tabId, activeSessionBuffer = null) {
           if (rawOutput) rawOutput.textContent = session.text;
         }
       }
-      if (index === 0) currentSession = session;
+      if (matchedSession) {
+        if (session === matchedSession) currentSession = session;
+      } else if (index === 0) {
+        currentSession = session;
+      }
     });
     
     const masterOut = document.getElementById('full-response-wrapper');
     if (masterOut) masterOut.style.display = 'block';
+    if (persistRecoveredCompletion && matchedSession) saveState(matchedSession);
   });
 }
 
-function saveState() {
-  if (!currentTabId) return;
-  const key = `state_${currentTabId}`;
-  chrome.storage.local.set({ 
-    [key]: { 
-      history: sessionHistory.map(s => ({ 
-        target: s.target, 
-        text: s.text, 
-        isFinished: s.isFinished, 
-        title: s.title || "",
-        providerLabel: s.providerLabel || ""
-      })),
-      timestamp: Date.now(),
-      url: currentSiteUrl // BUG-09: store URL to detect recycled tab IDs on next restore
-    } 
+function saveState(session = currentSession) {
+  if (!session || !sessionHistory.some(s => s.id === session.id)) return;
+  const key = getSiteStorageKey();
+  if (!session.id) session.id = generateSessionId();
+  const history = [{
+    id: session.id,
+    target: session.target,
+    text: session.text,
+    isFinished: session.isFinished,
+    title: session.title || "",
+    providerLabel: session.providerLabel || ""
+  }];
+  chrome.runtime.sendMessage({
+    action: 'UPSERT_SITE_SESSIONS',
+    key,
+    siteHost: currentSiteUrl,
+    history
   });
 }
 
@@ -426,7 +626,7 @@ function createSessionBlock(session, index) {
       const nextTitle = commit ? input.value : (session.title || getDefaultSessionTitle(targetInfo));
       input.replaceWith(titleEl);
       setSessionTitle(session, block, nextTitle);
-      if (commit) saveState();
+      if (commit) saveState(session);
     };
 
     input.addEventListener('click', evt => evt.stopPropagation());
@@ -443,11 +643,18 @@ function createSessionBlock(session, index) {
 
   deleteBtn.addEventListener('click', (e) => {
     e.stopPropagation(); // Prevent toggling the session when deleting
-    const historyIndex = sessionHistory.findIndex(s => s.target === targetInfo);
+    const historyIndex = sessionHistory.findIndex(s => s.id === session.id);
     if (historyIndex !== -1) {
-      sessionHistory.splice(historyIndex, 1);
+      const [deletedSession] = sessionHistory.splice(historyIndex, 1);
       block.remove();
-      saveState();
+      if (deletedSession?.id) {
+        chrome.runtime.sendMessage({
+          action: 'DELETE_SITE_SESSION',
+          key: getSiteStorageKey(),
+          sessionId: deletedSession.id
+        });
+        if (ownedSessionId === deletedSession.id) ownedSessionId = null;
+      }
       
       // If no sessions left, we might want to show a message or clear the master output
       if (sessionHistory.length === 0) {
@@ -602,10 +809,15 @@ document.getElementById('start-inspect')?.addEventListener('click', async () => 
 // Runtime Message Handling
 chrome.runtime.onMessage.addListener((message) => {
   if (message.action === 'ANALYSIS_START') {
-    if (currentTabId && message.tabId && message.tabId !== currentTabId) return;
+    if (!currentTabId || message.tabId !== currentTabId) return;
     
     const data = safeJsonParse(message.data);
-    if (!data) return;
+    if (!data || !message.sessionId) return;
+    // Invalidate a pending initial restore before its callback can replace this request.
+    restoreGeneration++;
+    const requestTabId = message.tabId;
+    const requestKey = getSiteStorageKey();
+    ownedSessionId = message.sessionId;
     setInspectionUIState(false);
     
     // Clear highlights on new selection
@@ -617,24 +829,39 @@ chrome.runtime.onMessage.addListener((message) => {
     const container = document.getElementById('results-container');
     const emptyState = container.querySelector('.empty-state');
     if (emptyState) emptyState.remove();
-    
-    // Get provider label asynchronously before creating session
-    getActiveProviderLabel().then((providerLabel) => {
-      currentSession = { target: data, text: "", isFinished: false, providerLabel: providerLabel };
-      const block = createSessionBlock(currentSession, sessionHistory.length);
-      currentSession.block = block;
-      
-      container.prepend(block);
-      sessionHistory.unshift(currentSession);
-      saveState();
 
-      // Clear Master Output for new session
-      const rawOutput = document.getElementById('full-response-text');
-      if (rawOutput) rawOutput.textContent = "";
+    // Create the request immediately so early stream chunks cannot land on a previous session.
+    let session = sessionHistory.find(s => s.id === message.sessionId);
+    if (!session) {
+      session = { id: message.sessionId, target: data, text: "", isFinished: false, providerLabel: "" };
+      sessionHistory.unshift(session);
+    }
+    currentSession = session;
+    if (!session.block?.isConnected) {
+      const block = createSessionBlock(session, sessionHistory.length - 1);
+      session.block = block;
+      container.prepend(block);
+    }
+    saveState(session);
+
+    const rawOutput = document.getElementById('full-response-text');
+    if (rawOutput) rawOutput.textContent = "";
+    getActiveProviderLabel().then((providerLabel) => {
+      if (requestTabId !== currentTabId || requestKey !== getSiteStorageKey() ||
+          (ownedSessionId !== message.sessionId && currentSession !== session) ||
+          !sessionHistory.includes(session)) return;
+      session.providerLabel = providerLabel;
+      const badge = session.block?.querySelector('.session-provider-badge');
+      if (badge) {
+        badge.innerText = providerLabel;
+        badge.style.display = 'inline-block';
+      }
+      saveState(session);
     });
 
   } else if (message.action === 'AI_STREAM_CHUNK') {
-    if (currentTabId && message.tabId && message.tabId !== currentTabId) return;
+    if (!currentTabId || message.tabId !== currentTabId) return;
+    if (!ownedSessionId || !currentSession || currentSession.id !== ownedSessionId) return;
 
     if (currentSession) {
       const loader = document.getElementById('loader');
@@ -646,7 +873,11 @@ chrome.runtime.onMessage.addListener((message) => {
       if (chunk === "FinishedSuccessfullyMark") {
         currentSession.isFinished = true;
         parseAndRenderCards(currentSession.text, currentSession.block.querySelector('.session-content'));
-        saveState();
+        saveState(currentSession);
+        ownedSessionId = null;
+        if (currentTabId) {
+          chrome.runtime.sendMessage({ action: 'CLEAR_ACTIVE_SESSION', tabId: currentTabId });
+        }
         return;
       }
 
@@ -674,6 +905,10 @@ chrome.runtime.onMessage.addListener((message) => {
     }
   } else if (message.action === 'AI_REFINEMENT_CHUNK') {
     handleRefinementChunk(message.data, message.locatorType);
+  } else if (message.action === 'SITE_STATE_CHANGED') {
+    if (message.key === getSiteStorageKey() && !isHealing && !ownedSessionId) {
+      restoreState(currentTabId);
+    }
   }
 });
 
@@ -943,18 +1178,27 @@ function parseAndRenderCards(text, contentArea) {
       else if (maxIdx === pwIdx) type = "Playwright";
     }
 
-    // 2. If no explicit header was found nearby, fallback to syntax heuristics
-    if (type === "AI Suggestion") {
-      if (code.startsWith("//") || code.startsWith("/") || code.startsWith("(")) {
-        type = "XPath";
-      } else if (code.includes("page.") || code.includes("getBy") || code.includes("locator(")) {
-        type = "Playwright";
-      } else if (!code.includes(" ") && !code.startsWith("/") && (code.includes(".") || code.includes("#") || code.includes("["))) {
-        type = "CSS";
+    // 2. Split code block into complete expressions, keeping wrapped multiline calls together
+    const getSyntaxType = (codeStr) => {
+      if (codeStr.startsWith("//") || codeStr.startsWith("/") || codeStr.startsWith("(")) {
+        return "XPath";
+      } else if (codeStr.includes("page.") || codeStr.includes("getBy") || codeStr.includes("locator(")) {
+        return "Playwright";
+      } else if (!codeStr.includes(" ") && !codeStr.startsWith("/") && (codeStr.includes(".") || codeStr.includes("#") || codeStr.includes("["))) {
+        return "CSS";
       }
-    }
+      return "AI Suggestion";
+    };
 
-    addBlock(type, code);
+    const expressions = splitCodeBlockIntoExpressions(code);
+    expressions.forEach(cleanLine => {
+      if (cleanLine.endsWith('`')) cleanLine = cleanLine.slice(0, -1).trim();
+      let lineType = type;
+      if (lineType === "AI Suggestion") {
+        lineType = getSyntaxType(cleanLine);
+      }
+      addBlock(lineType, cleanLine);
+    });
   }
 
   // Also parse line-by-line inside explicit sections. This catches malformed
@@ -1129,8 +1373,19 @@ function updateHealButtonsState() {
 document.getElementById('clear-all-btn').addEventListener('click', () => {
   if (confirm('Clear history?')) {
     sessionHistory = [];
+    ownedSessionId = null;
+    currentSession = null;
+    restoreGeneration++;
+    const key = getSiteStorageKey();
+    chrome.runtime.sendMessage({
+      action: 'CLEAR_SITE_STATE',
+      key,
+      siteHost: currentSiteUrl
+    }, () => restoreState(currentTabId));
     chrome.storage.local.remove(`state_${currentTabId}`);
-    restoreState(currentTabId);
+    if (currentTabId) {
+      chrome.runtime.sendMessage({ action: 'CLEAR_ACTIVE_SESSION', tabId: currentTabId });
+    }
   }
 });
 
@@ -1184,6 +1439,9 @@ function initIntelligenceHub() {
       tabPanes.forEach(pane => {
         pane.classList.toggle('active', pane.id === `tab-${targetTab}`);
       });
+      if (targetTab === 'settings') {
+        refreshEngineAvailability();
+      }
     });
   });
 
@@ -1318,6 +1576,21 @@ function initCollapsibleSections() {
   });
 }
 
+async function checkOllamaAvailability(url = 'http://localhost:11434') {
+  try {
+    const cleanUrl = (url || 'http://localhost:11434').trim().replace(/\/$/, '');
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1200);
+    const resp = await fetch(`${cleanUrl}/api/tags`, { signal: controller.signal });
+    clearTimeout(timeout);
+    if (!resp.ok) return false;
+    const data = await resp.json();
+    return Array.isArray(data.models) && data.models.length > 0;
+  } catch (e) {
+    return false;
+  }
+}
+
 async function isChromeAiAvailable() {
   try {
     const getApi = () => {
@@ -1345,6 +1618,68 @@ async function isChromeAiAvailable() {
   }
 }
 
+function updateEngineConfigVisibility(val) {
+  document.querySelectorAll('.engine-config').forEach(c => c.style.display = 'none');
+  if (val === 'ollama') {
+    document.getElementById('config-ollama').style.display = 'flex';
+    fetchOllamaModels();
+  } else if (val === 'openai') {
+    document.getElementById('config-openai').style.display = 'flex';
+    fetchOpenAIModels();
+  } else if (val === 'anthropic') {
+    document.getElementById('config-anthropic').style.display = 'flex';
+    fetchAnthropicModels();
+  } else if (val === 'google') {
+    document.getElementById('config-google').style.display = 'flex';
+    fetchGoogleModels();
+  }
+}
+
+async function refreshEngineAvailability(options = {}) {
+  const { updateUI = true } = options;
+  const select = document.getElementById('engine-select');
+  const nanoOpt = document.getElementById('option-gemini-nano');
+  const ollamaOpt = document.getElementById('option-ollama');
+  const ollamaNotice = document.getElementById('ollama-status-notice');
+  const ollamaUrl = document.getElementById('ollama-url')?.value?.trim() || 'http://localhost:11434';
+
+  const [chromeAiAvailable, ollamaAvailable] = await Promise.all([
+    isChromeAiAvailable(),
+    checkOllamaAvailability(ollamaUrl)
+  ]);
+
+  if (nanoOpt) nanoOpt.hidden = !chromeAiAvailable;
+  if (ollamaOpt) {
+    ollamaOpt.hidden = false;
+    ollamaOpt.innerText = 'Ollama';
+  }
+  if (ollamaNotice) {
+    ollamaNotice.style.display = ollamaAvailable ? 'none' : 'block';
+    ollamaNotice.style.color = ollamaAvailable ? 'var(--accent)' : '#f87171';
+    ollamaNotice.textContent = ollamaAvailable
+      ? 'Local Ollama server discovered successfully.'
+      : 'Ollama is offline or unreachable. Enter a custom endpoint or run ollama serve, then discover again.';
+  }
+
+  if (updateUI) {
+    const currentOpt = select?.querySelector(`option[value="${select.value}"]`);
+    if (!currentOpt || currentOpt.hidden) {
+      const firstAvailable = Array.from(select.options).find(opt => !opt.hidden);
+      if (firstAvailable) {
+        select.value = firstAvailable.value;
+        updateEngineConfigVisibility(select.value);
+        chrome.storage.local.get(['aiConfig'], (res) => {
+          const cfg = res.aiConfig || {};
+          cfg.engine = select.value;
+          chrome.storage.local.set({ aiConfig: cfg });
+        });
+      }
+    }
+  }
+
+  return { chromeAiAvailable, ollamaAvailable };
+}
+
 async function initEngineConfig() {
   const select = document.getElementById('engine-select');
   const saveBtn = document.getElementById('save-config-btn');
@@ -1353,48 +1688,37 @@ async function initEngineConfig() {
   const openaiSelect = document.getElementById('openai-model-select');
   const anthropicSelect = document.getElementById('anthropic-model-select');
   const googleSelect = document.getElementById('google-model-select');
+  const scopeSelect = document.getElementById('scope-select');
   const refreshOllamaBtn = document.getElementById('refresh-ollama-btn');
   const refreshOpenaiBtn = document.getElementById('refresh-openai-btn');
   const refreshAnthropicBtn = document.getElementById('refresh-anthropic-btn');
   const refreshGoogleBtn = document.getElementById('refresh-google-btn');
 
-  const chromeAiAvailable = await isChromeAiAvailable();
-  if (!chromeAiAvailable) {
-    const nanoOpt = document.getElementById('option-gemini-nano');
-    if (nanoOpt) nanoOpt.remove();
-  }
+  chrome.storage.local.get(['sidePanelScope', 'aiConfig'], async (res) => {
+    if (scopeSelect) {
+      scopeSelect.value = res.sidePanelScope || 'tab';
+    }
 
-  const updateVisibility = (val) => {
-    configs.forEach(c => c.style.display = 'none');
-    if (val === 'ollama') {
-      document.getElementById('config-ollama').style.display = 'flex';
-      fetchOllamaModels();
-    }
-    if (val === 'openai') {
-      document.getElementById('config-openai').style.display = 'flex';
-      fetchOpenAIModels();
-    }
-    if (val === 'anthropic') {
-      document.getElementById('config-anthropic').style.display = 'flex';
-      fetchAnthropicModels();
-    }
-    if (val === 'google') {
-      document.getElementById('config-google').style.display = 'flex';
-      fetchGoogleModels();
-    }
-  };
-
-  chrome.storage.local.get(['aiConfig'], (res) => {
     const config = res.aiConfig || { engine: 'ollama', ollamaUrl: 'http://localhost:11434' };
-    
+    if (config.ollamaUrl) document.getElementById('ollama-url').value = config.ollamaUrl;
+
+    const { chromeAiAvailable, ollamaAvailable } = await refreshEngineAvailability({ updateUI: false });
+
+    let configChanged = false;
     if (config.engine === 'gemini-nano' && !chromeAiAvailable) {
-      config.engine = 'ollama';
+      config.engine = ollamaAvailable ? 'ollama' : 'openai';
+      configChanged = true;
+    } else if (config.engine === 'ollama' && !ollamaAvailable) {
+      config.engine = chromeAiAvailable ? 'gemini-nano' : 'openai';
+      configChanged = true;
+    }
+
+    if (configChanged) {
+      chrome.storage.local.set({ aiConfig: config });
     }
 
     select.value = config.engine;
-    
-    if (config.ollamaUrl) document.getElementById('ollama-url').value = config.ollamaUrl;
-    
+
     // Temporarily store saved model name to pre-select after fetch
     if (config.ollamaModel) ollamaSelect.dataset.savedModel = config.ollamaModel;
     if (config.openaiModel && isOpenAIModelAllowedForDropdown(config.openaiModel)) {
@@ -1406,7 +1730,7 @@ async function initEngineConfig() {
     if (config.anthropicModel) anthropicSelect.dataset.savedModel = config.anthropicModel;
     if (config.googleModel) googleSelect.dataset.savedModel = config.googleModel;
 
-    updateVisibility(config.engine);
+    updateEngineConfigVisibility(select.value);
   });
 
   chrome.storage.session.get(['openaiKey', 'anthropicKey', 'googleKey'], (res) => {
@@ -1419,11 +1743,27 @@ async function initEngineConfig() {
     if (select.value === 'google') fetchGoogleModels();
   });
 
-  select.addEventListener('change', (e) => updateVisibility(e.target.value));
-  refreshOllamaBtn.addEventListener('click', () => fetchOllamaModels());
+  select.addEventListener('change', (e) => updateEngineConfigVisibility(e.target.value));
+  const discoverOllamaBtn = document.getElementById('discover-ollama-btn');
+  discoverOllamaBtn?.addEventListener('click', async () => {
+    discoverOllamaBtn.disabled = true;
+    discoverOllamaBtn.innerText = 'Discovering...';
+    const result = await refreshEngineAvailability();
+    if (result.ollamaAvailable) {
+      select.value = 'ollama';
+      updateEngineConfigVisibility('ollama');
+    }
+    discoverOllamaBtn.disabled = false;
+    discoverOllamaBtn.innerText = 'Discover Local LLM';
+  });
+  refreshOllamaBtn.addEventListener('click', async () => {
+    await refreshEngineAvailability();
+    fetchOllamaModels();
+  });
   refreshOpenaiBtn.addEventListener('click', () => fetchOpenAIModels());
   refreshAnthropicBtn.addEventListener('click', () => fetchAnthropicModels());
   refreshGoogleBtn.addEventListener('click', () => fetchGoogleModels());
+  document.getElementById('ollama-url').addEventListener('change', () => refreshEngineAvailability());
   document.getElementById('openai-key').addEventListener('change', () => fetchOpenAIModels());
   document.getElementById('anthropic-key').addEventListener('change', () => fetchAnthropicModels());
   document.getElementById('google-key').addEventListener('change', () => fetchGoogleModels());
@@ -1437,11 +1777,13 @@ async function initEngineConfig() {
       anthropicModel: anthropicSelect.value,
       googleModel: googleSelect.value
     };
+    const sidePanelScope = scopeSelect ? scopeSelect.value : 'tab';
     const openaiKey = document.getElementById('openai-key').value.trim();
     const anthropicKey = document.getElementById('anthropic-key').value.trim();
     const googleKey = document.getElementById('google-key').value.trim();
 
-    chrome.storage.local.set({ aiConfig }, () => {
+    chrome.storage.local.set({ aiConfig, sidePanelScope }, () => {
+      chrome.runtime.sendMessage({ action: 'UPDATE_PANEL_SCOPE', scope: sidePanelScope });
       chrome.storage.session.set({ openaiKey, anthropicKey, googleKey }, () => {
         const orig = saveBtn.innerText;
         saveBtn.innerText = "Settings Saved!";
@@ -1471,6 +1813,15 @@ function setModelOptions(select, models, savedModel, emptyLabel = 'Select Model.
     if (id === savedModel) opt.selected = true;
     select.appendChild(opt);
   });
+}
+
+function isOpenAIModelAllowedForDropdown(modelObj) {
+  if (!modelObj) return false;
+  const id = typeof modelObj === 'string' ? modelObj : (modelObj.id || modelObj.name || '');
+  if (!id || !isTaskSuitableModel(id)) return false;
+  // Dated snapshot models are deliberately excluded from saved selections.
+  if (/-\d{4}/.test(id)) return false;
+  return true;
 }
 
 // Rule 1: Exclude non-text/code specialized endpoints (audio, images, embeddings, moderation, etc.)
