@@ -37,9 +37,7 @@ function clearVerificationOverlays() {
   overlays.forEach(o => o.remove());
 }
 
-function clearAllPageVisuals() {
-  stopInspection();
-
+function clearVisualHighlights() {
   const selection = document.getElementById('qa-selection-overlay');
   if (selection) selection.style.display = 'none';
 
@@ -52,6 +50,11 @@ function clearAllPageVisuals() {
 
   clearVerificationOverlays();
   hideToast();
+}
+
+function clearAllPageVisuals() {
+  stopInspection();
+  clearVisualHighlights();
 }
 
 /**
@@ -287,7 +290,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     clearVerificationOverlays();
     sendResponse({ status: 'cleared' });
   } else if (message.action === 'CLEAR_HIGHLIGHTS') {
-    clearAllPageVisuals();
+    clearVisualHighlights();
     sendResponse({ status: 'cleared' });
   } else if (message.action === 'VERIFY_LOCATOR') {
     const result = verifyLocator(message.type, message.query);

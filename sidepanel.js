@@ -18,6 +18,10 @@ function safeJsonParse(value, fallback = null) {
   }
 }
 
+function generateSessionId() {
+  return 'sess_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+}
+
 function isEqualTarget(a, b) {
   if (!a || !b) return false;
   if (a.tagName !== b.tagName) return false;
@@ -33,6 +37,48 @@ function isEqualTarget(a, b) {
     }, {});
   };
   return JSON.stringify(sortKeys(a)) === JSON.stringify(sortKeys(b));
+}
+
+function splitCodeBlockIntoExpressions(code) {
+  const rawLines = code.split('\n');
+  const expressions = [];
+  let current = '';
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+
+  for (const rawLine of rawLines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    // Filter true comments without discarding XPath (/*[@id...], //button) or CSS (*[data-testid...], #id)
+    const isComment = /^(#\s+|\/\/\s+|\/\*(?!\*?[@\w\[\/])|\*\s+)/.test(line);
+    if (isComment && !current) continue;
+    if (/^(Rules:|Task:|System:|Target Profile:)/i.test(line)) continue;
+
+    if (current) {
+      current += ' ' + line;
+    } else {
+      current = line;
+    }
+
+    for (const ch of line) {
+      if (ch === '(') parenDepth++;
+      else if (ch === ')') parenDepth = Math.max(0, parenDepth - 1);
+      else if (ch === '{') braceDepth++;
+      else if (ch === '}') braceDepth = Math.max(0, braceDepth - 1);
+      else if (ch === '[') bracketDepth++;
+      else if (ch === ']') bracketDepth = Math.max(0, bracketDepth - 1);
+    }
+
+    if (parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) {
+      expressions.push(current.trim());
+      current = '';
+    }
+  }
+
+  if (current) expressions.push(current.trim());
+  return expressions;
 }
 
 function showPanelError(message) {
@@ -191,13 +237,14 @@ function init() {
   // FEAT-P7: Tab switching listener
   const isDetached = params.get('mode') === 'detached';
   if (!isDetached && chrome.tabs?.onActivated) {
-    chrome.tabs.onActivated.addListener(async ({ tabId }) => {
+    chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
+      const currentWin = await chrome.windows.getCurrent().catch(() => null);
+      if (currentWin && windowId !== currentWin.id) return;
+
       const data = await chrome.storage.local.get(['sidePanelScope']);
       const scope = data.sidePanelScope || 'tab';
 
       if (scope === 'tab') {
-        // In "Current Tab Only" mode, keep the side panel tied to its origin tab (currentTabId)
-        // without closing or resetting the session when the user views another tab
         return;
       }
 
@@ -205,6 +252,7 @@ function init() {
         if (currentTabId === tabId) return;
 
         if (currentTabId) {
+          chrome.runtime.sendMessage({ action: 'STOP_INSPECTION_SIGNAL', tabId: currentTabId });
           chrome.tabs.sendMessage(currentTabId, { action: 'STOP_INSPECTION' }).catch(() => {});
           setInspectionUIState(false);
         }
@@ -221,9 +269,22 @@ function init() {
     chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
       if (tabId !== currentTabId) return;
       if (changeInfo.status === 'complete' || changeInfo.url) {
+        let newHost = "";
+        try {
+          newHost = new URL(tab.url).hostname;
+        } catch (e) {
+          newHost = "Internal Page";
+        }
+        const hostChanged = newHost !== currentSiteUrl;
         updateTabInfo(tab);
+        if (hostChanged) {
+          sessionHistory = [];
+          syncWithBackground(tabId);
+        }
       }
     });
+
+    // Cross-tab site history synchronization is emitted by the shared service-worker owner.
   }
 }
 
@@ -353,11 +414,15 @@ function getSiteStorageKey() {
 
 async function restoreState(tabId, activeSessionBuffer = null) {
   const key = getSiteStorageKey();
-  // Also check legacy state_${tabId} for smooth backwards compatibility
   const legacyKey = `state_${tabId}`;
 
-  chrome.storage.local.get([key, legacyKey], async (result) => {
-    const stored = result[key] || result[legacyKey];
+  chrome.runtime.sendMessage({
+    action: 'GET_SITE_STATE',
+    key,
+    legacyKey,
+    siteHost: currentSiteUrl
+  }, async (stored) => {
+    if (chrome.runtime.lastError) return;
     sessionHistory = (stored && stored.history) || [];
     const container = document.getElementById('results-container');
     if (!container) return;
@@ -365,27 +430,34 @@ async function restoreState(tabId, activeSessionBuffer = null) {
     container.innerHTML = '';
     
     // Handle active buffer from background
+    let matchedSession = null;
     if (activeSessionBuffer && activeSessionBuffer.targetData) {
       const matchedIndex = sessionHistory.findIndex(s =>
         isEqualTarget(s.target, activeSessionBuffer.targetData)
       );
       
       if (matchedIndex === -1) {
-        if (activeSessionBuffer.isStreaming || (sessionHistory.length === 0 && activeSessionBuffer.accumulatedText)) {
+        if (activeSessionBuffer.isStreaming || activeSessionBuffer.accumulatedText) {
           const providerLabel = await getActiveProviderLabel();
           currentSession = { 
+            id: generateSessionId(),
             target: activeSessionBuffer.targetData, 
             text: activeSessionBuffer.accumulatedText || "", 
             isFinished: !activeSessionBuffer.isStreaming,
             providerLabel: providerLabel
           };
           sessionHistory.unshift(currentSession);
+          matchedSession = currentSession;
         }
       } else {
         currentSession = sessionHistory[matchedIndex];
+        matchedSession = currentSession;
         if (activeSessionBuffer.isStreaming) {
           currentSession.text = activeSessionBuffer.accumulatedText;
           currentSession.isFinished = false;
+        } else if (!currentSession.isFinished && activeSessionBuffer.accumulatedText) {
+          currentSession.text = activeSessionBuffer.accumulatedText;
+          currentSession.isFinished = true;
         }
       }
     }
@@ -422,7 +494,11 @@ async function restoreState(tabId, activeSessionBuffer = null) {
           if (rawOutput) rawOutput.textContent = session.text;
         }
       }
-      if (index === 0) currentSession = session;
+      if (matchedSession) {
+        if (session === matchedSession) currentSession = session;
+      } else if (index === 0) {
+        currentSession = session;
+      }
     });
     
     const masterOut = document.getElementById('full-response-wrapper');
@@ -432,18 +508,22 @@ async function restoreState(tabId, activeSessionBuffer = null) {
 
 function saveState() {
   const key = getSiteStorageKey();
-  chrome.storage.local.set({ 
-    [key]: { 
-      history: sessionHistory.map(s => ({ 
-        target: s.target, 
-        text: s.text, 
-        isFinished: s.isFinished, 
-        title: s.title || "",
-        providerLabel: s.providerLabel || ""
-      })),
-      timestamp: Date.now(),
-      url: currentSiteUrl
-    } 
+  const history = sessionHistory.map(session => {
+    if (!session.id) session.id = generateSessionId();
+    return {
+      id: session.id,
+      target: session.target,
+      text: session.text,
+      isFinished: session.isFinished,
+      title: session.title || "",
+      providerLabel: session.providerLabel || ""
+    };
+  });
+  chrome.runtime.sendMessage({
+    action: 'UPSERT_SITE_SESSIONS',
+    key,
+    siteHost: currentSiteUrl,
+    history
   });
 }
 
@@ -535,9 +615,15 @@ function createSessionBlock(session, index) {
     e.stopPropagation(); // Prevent toggling the session when deleting
     const historyIndex = sessionHistory.findIndex(s => s.target === targetInfo);
     if (historyIndex !== -1) {
-      sessionHistory.splice(historyIndex, 1);
+      const [deletedSession] = sessionHistory.splice(historyIndex, 1);
       block.remove();
-      saveState();
+      if (deletedSession?.id) {
+        chrome.runtime.sendMessage({
+          action: 'DELETE_SITE_SESSION',
+          key: getSiteStorageKey(),
+          sessionId: deletedSession.id
+        });
+      }
       
       // If no sessions left, we might want to show a message or clear the master output
       if (sessionHistory.length === 0) {
@@ -710,7 +796,7 @@ chrome.runtime.onMessage.addListener((message) => {
     
     // Get provider label asynchronously before creating session
     getActiveProviderLabel().then((providerLabel) => {
-      currentSession = { target: data, text: "", isFinished: false, providerLabel: providerLabel };
+      currentSession = { id: generateSessionId(), target: data, text: "", isFinished: false, providerLabel: providerLabel };
       const block = createSessionBlock(currentSession, sessionHistory.length);
       currentSession.block = block;
       
@@ -767,6 +853,10 @@ chrome.runtime.onMessage.addListener((message) => {
     }
   } else if (message.action === 'AI_REFINEMENT_CHUNK') {
     handleRefinementChunk(message.data, message.locatorType);
+  } else if (message.action === 'SITE_STATE_CHANGED') {
+    if (message.key === getSiteStorageKey() && !isHealing && (!currentSession || currentSession.isFinished)) {
+      restoreState(currentTabId);
+    }
   }
 });
 
@@ -1036,7 +1126,7 @@ function parseAndRenderCards(text, contentArea) {
       else if (maxIdx === pwIdx) type = "Playwright";
     }
 
-    // 2. Split lines inside code block in case AI grouped multiple selectors together
+    // 2. Split code block into complete expressions, keeping wrapped multiline calls together
     const getSyntaxType = (codeStr) => {
       if (codeStr.startsWith("//") || codeStr.startsWith("/") || codeStr.startsWith("(")) {
         return "XPath";
@@ -1048,13 +1138,9 @@ function parseAndRenderCards(text, contentArea) {
       return "AI Suggestion";
     };
 
-    const lines = code.split('\n').map(l => l.trim()).filter(Boolean);
-    lines.forEach(line => {
-      let cleanLine = line;
+    const expressions = splitCodeBlockIntoExpressions(code);
+    expressions.forEach(cleanLine => {
       if (cleanLine.endsWith('`')) cleanLine = cleanLine.slice(0, -1).trim();
-      if (/^(#\s|\/\/\s|\/\*|\*)/.test(cleanLine)) return;
-      if (/^(Rules:|Task:|System:|Target Profile:)/i.test(cleanLine)) return;
-
       let lineType = type;
       if (lineType === "AI Suggestion") {
         lineType = getSyntaxType(cleanLine);
@@ -1236,11 +1322,15 @@ document.getElementById('clear-all-btn').addEventListener('click', () => {
   if (confirm('Clear history?')) {
     sessionHistory = [];
     const key = getSiteStorageKey();
-    chrome.storage.local.remove([key, `state_${currentTabId}`]);
+    chrome.runtime.sendMessage({
+      action: 'CLEAR_SITE_STATE',
+      key,
+      siteHost: currentSiteUrl
+    }, () => restoreState(currentTabId));
+    chrome.storage.local.remove(`state_${currentTabId}`);
     if (currentTabId) {
       chrome.runtime.sendMessage({ action: 'CLEAR_ACTIVE_SESSION', tabId: currentTabId });
     }
-    restoreState(currentTabId);
   }
 });
 
@@ -1473,10 +1563,29 @@ async function isChromeAiAvailable() {
   }
 }
 
-async function refreshEngineAvailability() {
+function updateEngineConfigVisibility(val) {
+  document.querySelectorAll('.engine-config').forEach(c => c.style.display = 'none');
+  if (val === 'ollama') {
+    document.getElementById('config-ollama').style.display = 'flex';
+    fetchOllamaModels();
+  } else if (val === 'openai') {
+    document.getElementById('config-openai').style.display = 'flex';
+    fetchOpenAIModels();
+  } else if (val === 'anthropic') {
+    document.getElementById('config-anthropic').style.display = 'flex';
+    fetchAnthropicModels();
+  } else if (val === 'google') {
+    document.getElementById('config-google').style.display = 'flex';
+    fetchGoogleModels();
+  }
+}
+
+async function refreshEngineAvailability(options = {}) {
+  const { updateUI = true } = options;
   const select = document.getElementById('engine-select');
   const nanoOpt = document.getElementById('option-gemini-nano');
   const ollamaOpt = document.getElementById('option-ollama');
+  const ollamaNotice = document.getElementById('ollama-status-notice');
   const ollamaUrl = document.getElementById('ollama-url')?.value?.trim() || 'http://localhost:11434';
 
   const [chromeAiAvailable, ollamaAvailable] = await Promise.all([
@@ -1485,18 +1594,31 @@ async function refreshEngineAvailability() {
   ]);
 
   if (nanoOpt) nanoOpt.hidden = !chromeAiAvailable;
-  if (ollamaOpt) ollamaOpt.hidden = !ollamaAvailable;
+  if (ollamaOpt) {
+    ollamaOpt.hidden = !ollamaAvailable;
+    ollamaOpt.innerText = 'Ollama';
+  }
+  if (ollamaNotice) {
+    ollamaNotice.style.display = ollamaAvailable ? 'none' : 'block';
+    ollamaNotice.style.color = ollamaAvailable ? 'var(--accent)' : '#f87171';
+    ollamaNotice.textContent = ollamaAvailable
+      ? 'Local Ollama server discovered successfully.'
+      : 'Ollama is offline or unreachable. Enter a custom endpoint or run ollama serve, then discover again.';
+  }
 
-  const currentOpt = select?.querySelector(`option[value="${select.value}"]`);
-  if (!currentOpt || currentOpt.hidden) {
-    const firstAvailable = Array.from(select.options).find(opt => !opt.hidden);
-    if (firstAvailable) {
-      select.value = firstAvailable.value;
-      chrome.storage.local.get(['aiConfig'], (res) => {
-        const cfg = res.aiConfig || {};
-        cfg.engine = select.value;
-        chrome.storage.local.set({ aiConfig: cfg });
-      });
+  if (updateUI) {
+    const currentOpt = select?.querySelector(`option[value="${select.value}"]`);
+    if (!currentOpt || currentOpt.hidden) {
+      const firstAvailable = Array.from(select.options).find(opt => !opt.hidden);
+      if (firstAvailable) {
+        select.value = firstAvailable.value;
+        updateEngineConfigVisibility(select.value);
+        chrome.storage.local.get(['aiConfig'], (res) => {
+          const cfg = res.aiConfig || {};
+          cfg.engine = select.value;
+          chrome.storage.local.set({ aiConfig: cfg });
+        });
+      }
     }
   }
 
@@ -1517,26 +1639,6 @@ async function initEngineConfig() {
   const refreshAnthropicBtn = document.getElementById('refresh-anthropic-btn');
   const refreshGoogleBtn = document.getElementById('refresh-google-btn');
 
-  const updateVisibility = (val) => {
-    configs.forEach(c => c.style.display = 'none');
-    if (val === 'ollama') {
-      document.getElementById('config-ollama').style.display = 'flex';
-      fetchOllamaModels();
-    }
-    if (val === 'openai') {
-      document.getElementById('config-openai').style.display = 'flex';
-      fetchOpenAIModels();
-    }
-    if (val === 'anthropic') {
-      document.getElementById('config-anthropic').style.display = 'flex';
-      fetchAnthropicModels();
-    }
-    if (val === 'google') {
-      document.getElementById('config-google').style.display = 'flex';
-      fetchGoogleModels();
-    }
-  };
-
   chrome.storage.local.get(['sidePanelScope', 'aiConfig'], async (res) => {
     if (scopeSelect) {
       scopeSelect.value = res.sidePanelScope || 'tab';
@@ -1545,12 +1647,19 @@ async function initEngineConfig() {
     const config = res.aiConfig || { engine: 'ollama', ollamaUrl: 'http://localhost:11434' };
     if (config.ollamaUrl) document.getElementById('ollama-url').value = config.ollamaUrl;
 
-    const { chromeAiAvailable, ollamaAvailable } = await refreshEngineAvailability();
+    const { chromeAiAvailable, ollamaAvailable } = await refreshEngineAvailability({ updateUI: false });
 
+    let configChanged = false;
     if (config.engine === 'gemini-nano' && !chromeAiAvailable) {
       config.engine = ollamaAvailable ? 'ollama' : 'openai';
+      configChanged = true;
     } else if (config.engine === 'ollama' && !ollamaAvailable) {
       config.engine = chromeAiAvailable ? 'gemini-nano' : 'openai';
+      configChanged = true;
+    }
+
+    if (configChanged) {
+      chrome.storage.local.set({ aiConfig: config });
     }
 
     select.value = config.engine;
@@ -1566,7 +1675,7 @@ async function initEngineConfig() {
     if (config.anthropicModel) anthropicSelect.dataset.savedModel = config.anthropicModel;
     if (config.googleModel) googleSelect.dataset.savedModel = config.googleModel;
 
-    updateVisibility(select.value);
+    updateEngineConfigVisibility(select.value);
   });
 
   chrome.storage.session.get(['openaiKey', 'anthropicKey', 'googleKey'], (res) => {
@@ -1579,7 +1688,19 @@ async function initEngineConfig() {
     if (select.value === 'google') fetchGoogleModels();
   });
 
-  select.addEventListener('change', (e) => updateVisibility(e.target.value));
+  select.addEventListener('change', (e) => updateEngineConfigVisibility(e.target.value));
+  const discoverOllamaBtn = document.getElementById('discover-ollama-btn');
+  discoverOllamaBtn?.addEventListener('click', async () => {
+    discoverOllamaBtn.disabled = true;
+    discoverOllamaBtn.innerText = 'Discovering...';
+    const result = await refreshEngineAvailability();
+    if (result.ollamaAvailable) {
+      select.value = 'ollama';
+      updateEngineConfigVisibility('ollama');
+    }
+    discoverOllamaBtn.disabled = false;
+    discoverOllamaBtn.innerText = 'Discover Local LLM';
+  });
   refreshOllamaBtn.addEventListener('click', async () => {
     await refreshEngineAvailability();
     fetchOllamaModels();
@@ -1643,6 +1764,7 @@ function isOpenAIModelAllowedForDropdown(modelObj) {
   if (!modelObj) return false;
   const id = typeof modelObj === 'string' ? modelObj : (modelObj.id || modelObj.name || '');
   if (!id || !isTaskSuitableModel(id)) return false;
+  // Dated snapshot models are deliberately excluded from saved selections.
   if (/-\d{4}/.test(id)) return false;
   return true;
 }

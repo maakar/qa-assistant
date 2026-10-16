@@ -712,9 +712,19 @@
           </select>
         </div>
 
+        <div style="margin-bottom:12px; display:flex; flex-direction:column; gap:8px;">
+          <label class="intel-label">Local LLM Endpoint</label>
+          <div style="display:flex; gap:8px;">
+            <input type="text" id="ollama-url" placeholder="Endpoint (e.g. http://localhost:11434)" value="http://localhost:11434" style="flex:1; min-width:0; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:8px; padding:10px; font-size:0.8rem;">
+            <button id="discover-ollama-btn" type="button" style="background:var(--btn-primary-bg); color:var(--text); border:1px solid var(--border); border-radius:8px; padding:8px 10px; font-size:0.75rem; cursor:pointer;">Discover Local LLM</button>
+          </div>
+          <div id="ollama-status-notice" style="display:none; font-size:0.75rem; color:#f87171; line-height:1.4;">
+            Ollama is offline or unreachable. Enter a custom endpoint or run <code>ollama serve</code>, then discover again.
+          </div>
+        </div>
+
         <!-- Ollama Config -->
         <div id="config-ollama" class="engine-config" style="display:none; flex-direction:column; gap:10px;">
-          <input type="text" id="ollama-url" placeholder="Endpoint (e.g. http://localhost:11434)" value="http://localhost:11434" style="width:100%; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:8px; padding:10px; font-size:0.8rem;">
           <div style="display:flex; gap:8px; align-items:center;">
             <select id="ollama-model-select" style="flex:1; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:8px; padding:10px; font-size:0.8rem; outline:none;">
               <option value="">Select Model...</option>
