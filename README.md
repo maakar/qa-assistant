@@ -103,7 +103,7 @@ chmod +x package-extension.sh
 ./package-extension.sh
 ```
 
-This generates `qa-assistant-v2.0.1.zip` with an explicit allowlist of runtime files and the license, with `manifest.json` at the archive root. Existing output is never overwritten; pass a different path to create another archive, e.g. `./package-extension.sh /tmp/qa-assistant-release.zip`. Check the archive and smoke-test the extracted build in Chrome before submission. See [STORE_LISTING.md](STORE_LISTING.md) for the release checklist.
+This generates `qa-assistant-v2.0.1.zip` with an explicit allowlist of runtime files and the license, with `manifest.json` at the archive root. Existing output is never overwritten; pass a different path to create another archive, e.g. `./package-extension.sh /tmp/qa-assistant-release.zip`. Check the archive and smoke-test the extracted build in Chrome before submission.
 
 ---
 
