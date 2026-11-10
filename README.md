@@ -3,7 +3,7 @@
 <div align="center">
 
 [![Manifest V3](https://img.shields.io/badge/Chrome_Extension-Manifest_V3-4285F4?logo=googlechrome&logoColor=white)](#)
-[![Version](https://img.shields.io/badge/version-2.0.0-81C995)](#)
+[![Version](https://img.shields.io/badge/version-2.0.1-81C995)](#)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Chrome_116+-202124)](#)
 
@@ -15,7 +15,7 @@
 
 ## 🎯 Overview
 
-**QA Assistant** is an open-source Chrome extension built for software test engineers, QA automation professionals, and developers. It accelerates writing test automation by capturing DOM elements, generating robust locators across major test frameworks, validating uniqueness directly on the live page, and self-healing broken selectors using AI.
+**QA Assistant** is an open-source Chrome extension built for software test engineers, QA automation professionals, and developers. It assists with test automation by capturing DOM elements, generating locator candidates, checking matches on the live page, and requesting AI-assisted replacements for selectors.
 
 Integrated directly into Chrome's native **Side Panel**, QA Assistant works seamlessly alongside your web application without obscuring page content or interrupting your workflow.
 
@@ -25,20 +25,20 @@ Integrated directly into Chrome's native **Side Panel**, QA Assistant works seam
 
 - **🔍 Point & Click Element Inspection:** Click any button, input, or container on your test application to capture its DOM attributes, accessibility roles, and hierarchy.
 - **🤖 Multi-Engine AI (Bring Your Own Key / BYOK):**
-  - **Local Ollama:** 100% private, runs entirely on your local machine with zero external network traffic.
+  - **Ollama:** Connect to a local server by default, or configure another HTTP(S) endpoint. A remote endpoint receives your prompts.
   - **Cloud Providers (BYOK):** Connect directly to **OpenAI**, **Anthropic Claude**, or **Google Gemini** using your personal API keys.
-  - **Dynamic Model Discovery:** Automatically queries your provider's API to fetch the latest supported text, code, and reasoning models available on your account—no hardcoded or outdated model lists.
-  - **Smart Tier Grouping:** Automatically categorizes discovered models into practical performance and budget tiers (lightweight/fast, balanced, and high-capability reasoning).
-  - **Chrome Built-In AI:** Experimental support for Chrome's native on-device Gemini Nano via the Prompt API.
-- **🎭 Multi-Framework Locators:** Generates clean, resilient locators for:
+  - **Model Discovery:** Queries provider model lists and filters and ranks candidates using naming heuristics; the list is limited and may not include every suitable model.
+  - **Tier Heuristics:** Picks a mix of approximate budget tiers where available; these are not guarantees of price or capability.
+  - **Chrome Built-In AI:** Experimental support for a detected Prompt API in the target tab; availability depends on the page and Chrome configuration.
+- **🎭 Multi-Framework Locators:** Generates locator candidates for:
   - **Playwright:** `page.getByRole()`, `page.getByTestId()`, `page.getByText()`, `page.locator()`
-  - **Cypress / Selenium:** Best-practice CSS selectors and scoped XPath queries.
-- **⚡ Real-Time In-Page Verification:** Test any generated or manual locator with one click. Visual badges highlight matches on the live page:
-  - 🟢 **Unique (1):** Ideal, resilient locator.
-  - 🟡 **Brittle (>1):** Matches multiple elements; prompts refinement.
-  - 🔴 **Broken (0):** No elements matched.
-- **🩹 AI Self-Healing & Memory:** If an element changes, click **Heal** to automatically diagnose failures and generate an updated selector. Proven patterns are saved to your local **Knowledge Base**.
-- **❄️ Page Freeze Tool:** 3-second countdown freeze with DevTools debugger integration to inspect ephemeral tooltips, flyout menus, and hover states.
+  - **Cypress / Selenium:** CSS selectors and XPath queries.
+- **⚡ Real-Time In-Page Verification:** Check generated or manual locators with one click; matches are highlighted on the live page. Playwright expressions are approximated using native CSS/XPath, not evaluated by Playwright, so results can differ from the test framework. Verify candidates in your actual tests.
+  - 🟢 **Unique (1):** The in-page check found one match; this does not guarantee resilience.
+  - 🟡 **Brittle (>1):** The check found multiple matches; refinement may be needed.
+  - 🔴 **Broken (0):** The check found no matches; unsupported or invalid expressions can also produce this result.
+- **🩹 AI Self-Healing & Memory:** Click **Heal** to request and verify replacement selectors, with retries. Use **Learn** to save a selector to the local **Knowledge Base**; saving is not automatic.
+- **❄️ Page Freeze Tool:** A countdown triggers a JavaScript `debugger` statement to inspect ephemeral UI. Open DevTools for the target tab before using it; resume execution in DevTools afterwards. Without an attached debugger, the page will not pause.
 - **🎨 Chrome-Native Dark & Light Theme:** Beautifully matches Chrome's neutral aesthetic with collapsible tool sections and minimal screen footprint.
 
 ---
@@ -62,58 +62,48 @@ Integrated directly into Chrome's native **Side Panel**, QA Assistant works seam
 
 ## ⚙️ AI Engine Configuration (BYOK)
 
-QA Assistant follows a **Bring Your Own Key (BYOK)** model. You maintain complete control over which provider, models, and budget tiers you use:
+QA Assistant supports **Bring Your Own Key (BYOK)** for cloud providers. Choose a provider and a model from the available options:
 
-### 1. Local AI via Ollama (Recommended for Air-Gapped / Private Testing)
+### 1. AI via Ollama
 1. Install and start [Ollama](https://ollama.ai/):
    ```bash
    ollama run llama3.1
    # or any code/instruction model of your choice
    ```
 2. In QA Assistant **Settings**, select **Ollama** as the Active Engine (endpoint defaults to `http://localhost:11434`).
-3. Click **Refresh Models** to populate installed local models, select your model, and click **Save Settings**.
-4. *Zero data leaves your computer.*
+3. Click **Refresh Models** to query the configured server's models, select a model, and click **Save Engine Settings**.
+4. Verify the endpoint and your network setup before using sensitive data. The default endpoint is local; a custom endpoint can be remote.
 
 ### 2. Cloud AI Providers (OpenAI / Anthropic / Google Gemini)
 1. In QA Assistant **Settings**, select your preferred provider in **Active Engine**.
 2. Paste your personal API Key.
-3. Click **Refresh Models**: the extension dynamically queries the provider's API to detect the newest and most suitable models accessible to your key, filtering out obsolete or incompatible endpoints.
-4. Select your preferred model and budget tier, then click **Save Settings**.
+3. Click **Refresh Models** to query the provider's model list. The extension applies heuristic filters and displays a limited selection; it cannot guarantee model suitability. Model discovery may also run when you select an engine or change a key.
+4. Select a model and click **Save Engine Settings**. The displayed mix of model tiers is heuristic, not a separate budget control.
 
 ---
 
 ## 🛡️ Security & API Key Handling
 
-Security and privacy are core architectural priorities of QA Assistant:
+- **Direct provider requests:** External-engine analysis and healing prompts go from the extension to the configured endpoint, without a QAMethod proxy in the extension code. Cloud keys authenticate requests; Google's key is included in the request URL. Ollama defaults to localhost but supports remote HTTP(S) endpoints; HTTP does not encrypt traffic.
+- **Data sent to AI:** After selecting an element, analysis prompts include selected profile fields, including attributes, text and parent/ancestor details, rather than full page HTML. Container text can include descendant text. Analysis may also include custom rules and relevant learned selectors. Healing uses profile fields, current and previously tried locators, and a match-count value currently fixed at zero; it may make multiple requests. Chrome Built-in AI runs in the target page's main world and passes the full captured profile JSON or refinement object as an injection argument alongside the prompt. Page-controlled AI globals can receive the prompt, and responses are posted as messages to the page. Whether page scripts can directly observe the otherwise unused full analysis argument has not been verified; do not assume this data is isolated from the page. Review sensitive data and provider policies before use.
+- **Browser storage:** Engine settings, rules, saved patterns and per-host analysis history (including element profiles and responses) are kept in `chrome.storage.local`. The settings save flow keeps cloud keys in `chrome.storage.session`, not persistent local settings; keys generally need re-entry after browser restart. Chrome storage is not a dedicated encrypted secrets vault.
+- **Other requests and diagnostics:** Availability checks and model discovery can run independently of analysis, including when the panel or settings opens, an engine is selected, or a key changes. Model-list requests use the entered cloud key but do not include the element profile. **Copy Beta Diagnostics** copies version, tab ID, target hostname, session count, provider and timestamp, not scrubbed session logs. Review copied content before sharing.
+- **Deletion:** The header trash button clears the current site's stored history, current tab's legacy entry and current tab's active buffer, not other tabs' legacy entries or active buffers, other sites, saved patterns, rules or settings; deletion IDs remain locally. Individual deletion may leave a legacy entry or active buffer. Manage the Knowledge Base and rules separately. Clear keys and save settings; revoke keys with the provider if needed. Provider-side data is not deleted by these controls.
 
-- **🔒 Direct Client-to-API Communication (Zero Intermediaries):**
-  - All AI requests are made **directly** from your local browser to your configured provider endpoint (e.g. `api.openai.com`, `api.anthropic.com`, `generativelanguage.googleapis.com`, or local `localhost:11434`).
-  - There are **no intermediary proxy servers, third-party relays, or tracking backends**. QAMethod never sees or handles your traffic.
-- **💾 Encrypted Local Storage Only (`chrome.storage.local`):**
-  - Your API keys, custom endpoints, and preferences are stored exclusively in Chrome's sandboxed `chrome.storage.local` on your local device.
-  - Keys are **never** synced to Google accounts (`chrome.storage.sync` is deliberately avoided for credentials).
-- **🧹 Sanitized Diagnostics & Exports:**
-  - The built-in diagnostics export tool strictly scrubs and redacts API keys and sensitive tokens before displaying or copying session logs.
-- **🎯 Minimal On-Demand Data Exposure:**
-  - The extension never monitors web browsing in the background or sends full page contents.
-  - Only when you explicitly click *Analyze Element*, a pruned HTML snippet containing only the targeted element's structural attributes (tag, classes, test IDs, and accessibility roles) is sent to your chosen AI engine.
-- **🗑️ Instant Revocation & Full User Control:**
-  - You can update, overwrite, or clear your API keys at any time directly in the Settings panel.
-  - Uninstalling the extension immediately wipes all stored keys and data from your browser storage.
-  - For full legal disclosures, see [PRIVACY_POLICY.md](PRIVACY_POLICY.md).
+See [PRIVACY_POLICY.md](PRIVACY_POLICY.md) for more details.
 
 ---
 
 ## 📦 Building for Chrome Web Store
 
-To build a clean production `.zip` package for the Chrome Web Store:
+To build a `.zip` package for Chrome Web Store review:
 
 ```bash
 chmod +x package-extension.sh
 ./package-extension.sh
 ```
 
-This generates `qa-assistant-v2.0.0.zip` containing only active runtime files (excluding docs, scripts, and tests).
+This generates `qa-assistant-v2.0.1.zip` with an explicit allowlist of runtime files and the license, with `manifest.json` at the archive root. Existing output is never overwritten; pass a different path to create another archive, e.g. `./package-extension.sh /tmp/qa-assistant-release.zip`. Check the archive and smoke-test the extracted build in Chrome before submission.
 
 ---
 
